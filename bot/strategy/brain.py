@@ -29,53 +29,24 @@ log = get_logger(__name__)
 
 
 # =========================
-# 🔥 FINAL BOSS AI SYSTEM
+# 🔥 SIMULATION ENGINE
 # =========================
-import os
-USE_LLM = bool(os.getenv("OPENAI_API_KEY"))
+def simulate_combat(my_hp, my_atk, my_def, enemy, equipped, weather):
+    enemy_hp = enemy.get("hp", 100)
 
-STRATEGY = {"mode": "adaptive", "risk": 0.7}
-TURN_COUNTER = 0
+    my_dmg = calc_damage(my_atk, get_weapon_bonus(equipped),
+                         enemy.get("def", 5), weather)
 
-def 
-    # turn 1
-    my_dmg1 = calc_damage(my_atk, get_weapon_bonus(equipped),
-                          enemy.get("def", 5), weather)
-    enemy_dmg1 = calc_damage(enemy.get("atk", 10),
-                             _estimate_enemy_weapon_bonus(enemy),
-                             my_def, weather)
-
-    hp_after_1 = my_hp - enemy_dmg1
-    enemy_after_1 = enemy.get("hp", 100) - my_dmg1
-
-    # turn 2 prediction (simplified)
-    my_dmg2 = my_dmg1
-    enemy_dmg2 = enemy_dmg1
-
-    hp_after_2 = hp_after_1 - enemy_dmg2
-    enemy_after_2 = enemy_after_1 - my_dmg2
+    enemy_dmg = calc_damage(enemy.get("atk", 10),
+                            _estimate_enemy_weapon_bonus(enemy),
+                            my_def, weather)
 
     return {
-        "my_hp": hp_after_2,
-        "enemy_hp": enemy_after_2,
-        "win": enemy_after_2 <= 0,
-        "survive": hp_after_2 > 0
+        "my_hp": my_hp - enemy_dmg,
+        "enemy_hp": enemy_hp - my_dmg,
+        "win": (enemy_hp - my_dmg) <= 0,
+        "survive": (my_hp - enemy_dmg) > 0
     }
-
-def 
-    score = 0
-    if sim["win"]:
-        score += 120
-    if not sim["survive"]:
-        score -= 200
-
-    score += (hp - sim["my_hp"]) * -0.5
-    score += (enemy_hp - sim["enemy_hp"]) * 0.8
-
-    if sim["my_hp"] < 30:
-        score -= 40
-
-    return score
 
 
 # ── Weapon stats from combat-items.md ─────────────────────────────────
@@ -374,32 +345,15 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                                   f"(120 sMoltz! dmg={my_dmg} vs {guardian_dmg})"}
 
     # ── Priority 6: Favorable agent combat ────────────────────────
+    # 🔥 SIMULATION ENHANCED COMBAT
+
     # Be more aggressive when fewer agents remain (late game)
     # Per game-systems.md: avoid combat in storm(-15%) or fog(-10%)
     hp_threshold = 40 if alive_count > 20 else 25
     enemies = [a for a in visible_agents
                if not a.get("isGuardian", False) and a.get("isAlive", True)
                and a.get("id") != self_data.get("id")]
-    
-if enemies and ep >= 2 and hp >= hp_threshold:
-    best_target = None
-    best_score = -999
-
-    for enemy in enemies:
-        sim = 
-        score = 
-
-        if score > best_score:
-            best_score = score
-            best_target = enemy
-
-    if best_target and best_score > 15:
-        return {
-            "action": "attack",
-            "data": {"targetId": best_target["id"], "targetType": "agent"},
-            "reason": f"FINAL_BOSS_ATTACK score={best_score:.1f}"
-        }
-
+    if enemies and ep >= 2 and hp >= hp_threshold:
         target = _select_weakest(enemies)
         w_range = get_weapon_range(equipped)
         if _is_in_range(target, region_id, w_range, connections):
