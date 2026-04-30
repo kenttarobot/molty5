@@ -37,7 +37,7 @@ USE_LLM = bool(os.getenv("OPENAI_API_KEY"))
 STRATEGY = {"mode": "adaptive", "risk": 0.7}
 TURN_COUNTER = 0
 
-def simulate_combat_2turn(my_hp, my_atk, my_def, enemy, equipped, weather):
+def 
     # turn 1
     my_dmg1 = calc_damage(my_atk, get_weapon_bonus(equipped),
                           enemy.get("def", 5), weather)
@@ -62,7 +62,7 @@ def simulate_combat_2turn(my_hp, my_atk, my_def, enemy, equipped, weather):
         "survive": hp_after_2 > 0
     }
 
-def evaluate_combat_score(hp, sim, enemy_hp):
+def 
     score = 0
     if sim["win"]:
         score += 120
@@ -386,8 +386,8 @@ if enemies and ep >= 2 and hp >= hp_threshold:
     best_score = -999
 
     for enemy in enemies:
-        sim = simulate_combat_2turn(hp, atk, defense, enemy, equipped, region_weather)
-        score = evaluate_combat_score(hp, sim, enemy.get("hp", 100))
+        sim = 
+        score = 
 
         if score > best_score:
             best_score = score
