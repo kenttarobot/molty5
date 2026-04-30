@@ -29,24 +29,53 @@ log = get_logger(__name__)
 
 
 # =========================
-# 🔥 HYBRID AI LAYER (INJECTED)
+# 🔥 FINAL BOSS AI SYSTEM
 # =========================
-import os, json
+import os
 USE_LLM = bool(os.getenv("OPENAI_API_KEY"))
-STRATEGY = {"mode": "balanced", "risk": 0.5}
+
+STRATEGY = {"mode": "adaptive", "risk": 0.7}
 TURN_COUNTER = 0
 
-def ask_llm_strategy(view):
-    try:
-        from openai import OpenAI
-        client = OpenAI()
-        res = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": f"HP:{view['self']['hp']} EP:{view['self']['ep']} Alive:{view.get('aliveCount')} Enemies:{len(view.get('visibleAgents', []))}"}],
-        )
-        return {"mode": "aggressive" if "attack" in res.choices[0].message.content.lower() else "balanced", "risk": 0.5}
-    except:
-        return {"mode": "balanced", "risk": 0.5}
+def simulate_combat_2turn(my_hp, my_atk, my_def, enemy, equipped, weather):
+    # turn 1
+    my_dmg1 = calc_damage(my_atk, get_weapon_bonus(equipped),
+                          enemy.get("def", 5), weather)
+    enemy_dmg1 = calc_damage(enemy.get("atk", 10),
+                             _estimate_enemy_weapon_bonus(enemy),
+                             my_def, weather)
+
+    hp_after_1 = my_hp - enemy_dmg1
+    enemy_after_1 = enemy.get("hp", 100) - my_dmg1
+
+    # turn 2 prediction (simplified)
+    my_dmg2 = my_dmg1
+    enemy_dmg2 = enemy_dmg1
+
+    hp_after_2 = hp_after_1 - enemy_dmg2
+    enemy_after_2 = enemy_after_1 - my_dmg2
+
+    return {
+        "my_hp": hp_after_2,
+        "enemy_hp": enemy_after_2,
+        "win": enemy_after_2 <= 0,
+        "survive": hp_after_2 > 0
+    }
+
+def evaluate_combat_score(hp, sim, enemy_hp):
+    score = 0
+    if sim["win"]:
+        score += 120
+    if not sim["survive"]:
+        score -= 200
+
+    score += (hp - sim["my_hp"]) * -0.5
+    score += (enemy_hp - sim["enemy_hp"]) * 0.8
+
+    if sim["my_hp"] < 30:
+        score -= 40
+
+    return score
 
 
 # ── Weapon stats from combat-items.md ─────────────────────────────────
@@ -177,13 +206,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
     Uses ALL api-summary.md view fields for decision making.
     """
-    
-    global TURN_COUNTER, STRATEGY
-    TURN_COUNTER += 1
-    if USE_LLM and TURN_COUNTER % 5 == 0:
-        STRATEGY.update(ask_llm_strategy(view))
     self_data = view.get("self", {})
-
     region = view.get("currentRegion", {})
     hp = self_data.get("hp", 100)
     ep = self_data.get("ep", 10)
@@ -357,7 +380,26 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     enemies = [a for a in visible_agents
                if not a.get("isGuardian", False) and a.get("isAlive", True)
                and a.get("id") != self_data.get("id")]
-    if enemies and ep >= 2 and hp >= hp_threshold:
+    
+if enemies and ep >= 2 and hp >= hp_threshold:
+    best_target = None
+    best_score = -999
+
+    for enemy in enemies:
+        sim = simulate_combat_2turn(hp, atk, defense, enemy, equipped, region_weather)
+        score = evaluate_combat_score(hp, sim, enemy.get("hp", 100))
+
+        if score > best_score:
+            best_score = score
+            best_target = enemy
+
+    if best_target and best_score > 15:
+        return {
+            "action": "attack",
+            "data": {"targetId": best_target["id"], "targetType": "agent"},
+            "reason": f"FINAL_BOSS_ATTACK score={best_score:.1f}"
+        }
+
         target = _select_weakest(enemies)
         w_range = get_weapon_range(equipped)
         if _is_in_range(target, region_id, w_range, connections):
@@ -411,50 +453,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     if ep < 4 and not enemies and not region.get("isDeathZone") and region_id not in danger_ids:
         return {"action": "rest", "data": {},
                 "reason": f"REST: EP={ep}/{max_ep}, area is safe (+1 bonus EP)"}
-
-    
-    # =========================
-    # 🧠 UTILITY AI (FINAL LAYER)
-    # =========================
-    try:
-        mode = STRATEGY.get("mode", "balanced")
-        risk = STRATEGY.get("risk", 0.5)
-
-        candidates = []
-
-        # Heal scoring
-        heal_item = _find_healing_item(inventory, critical=(hp < 30))
-        if heal_item:
-            score = (100 - hp) * 1.5
-            if mode == "defensive":
-                score *= 1.4
-            candidates.append((score, {"action": "use_item", "data": {"itemId": heal_item["id"]}, "reason": "UTILITY_HEAL"}))
-
-        # Attack scoring
-        enemies_util = [a for a in visible_agents if a.get("isAlive") and not a.get("isGuardian")]
-        if enemies_util:
-            target = _select_weakest(enemies_util)
-            my_dmg = calc_damage(atk, get_weapon_bonus(equipped), target.get("def", 5), region_weather)
-            enemy_dmg = calc_damage(target.get("atk", 10), _estimate_enemy_weapon_bonus(target), defense, region_weather)
-            score = (my_dmg - enemy_dmg) * 2
-            if mode == "aggressive":
-                score *= (1.2 + risk)
-            if score > 0:
-                candidates.append((score, {"action": "attack", "data": {"targetId": target["id"], "targetType": "agent"}, "reason": "UTILITY_ATTACK"}))
-
-        # Move scoring
-        if ep >= move_ep_cost:
-            for conn in connections:
-                rid = conn if isinstance(conn, str) else conn.get("id", "")
-                if rid:
-                    score = 10
-                    candidates.append((score, {"action": "move", "data": {"regionId": rid}, "reason": "UTILITY_MOVE"}))
-
-        if candidates:
-            best = max(candidates, key=lambda x: x[0])[1]
-            return best
-    except Exception as e:
-        log.debug("Utility fallback error: %s", e)
 
     return None  # Wait for next turn
 
