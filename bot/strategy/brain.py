@@ -2,13 +2,14 @@
 Strategy brain — main decision engine with priority-based action selection.
 Implements the game-loop.md priority chain for high win rate.
 
-v2.0.0 - ULTIMATE SMOLTZ FARMING WITH HIGH ATK PRIORITY
+v2.0.1 - ULTIMATE SMOLTZ FARMING WITH CLAIM FIX
 ==========================================================
 KEY FEATURES:
 - HIGH ATK PRIORITY: Always equip best weapon, hunt for weapon upgrades
 - HP/EP MANAGEMENT: Maintain both above 60% at all times
-- SMOLTZ FIRST: Pickup currency immediately, hunt guardians (120 sMoltz)
+- SMOLTZ FIRST: Pickup currency immediately, claim from inventory
 - WEAKEST ENEMY FIRST: Target lowest HP enemies for quick kills
+- CLAIM SMOLTZ: Auto-convert $Moltz items to sMOLTZ
 - AGGRESSIVE FARMING: Balance between survival and maximum sMoltz collection
 """
 
@@ -170,10 +171,11 @@ def reset_game_state():
     }
     _map_knowledge = {"revealed": False, "death_zones": set(), "safe_center": [], "rich_regions": []}
     log.info("=" * 50)
-    log.info("🎯 ULTIMATE SMOLTZ FARMING MODE v2.0.0")
+    log.info("🎯 ULTIMATE SMOLTZ FARMING MODE v2.0.1")
     log.info("   - High ATK priority")
     log.info("   - HP/EP > 60% maintenance")
     log.info("   - Weakest enemy first")
+    log.info("   - Auto-claim sMOLTZ from inventory")
     log.info("=" * 50)
 
 
@@ -215,9 +217,7 @@ def learn_from_map(view: dict):
 # =========================
 
 def _check_hp_status(hp: int, max_hp: int = 100) -> dict:
-    """Check HP status and return recommendations.
-    v2.0.0: Maintain HP above 60% at all times.
-    """
+    """Check HP status and return recommendations."""
     hp_ratio = hp / max_hp if max_hp > 0 else 1.0
     
     if hp < HP_CRITICAL:
@@ -229,9 +229,7 @@ def _check_hp_status(hp: int, max_hp: int = 100) -> dict:
 
 
 def _check_ep_status(ep: int, max_ep: int) -> dict:
-    """Check EP status and return recommendations.
-    v2.0.0: Maintain EP above 60% at all times.
-    """
+    """Check EP status and return recommendations."""
     ep_ratio = ep / max_ep if max_ep > 0 else 1.0
     
     if ep_ratio < EP_CRITICAL:
@@ -246,16 +244,13 @@ def _manage_hp(hp: int, inventory: list, enemies_nearby: bool, in_deathzone: boo
     """Manage HP - heal if below 60%, prioritize keeping HP high."""
     hp_status = _check_hp_status(hp)
     
-    # Critical HP: Use best healing available
     if hp_status["status"] == "critical":
-        # Find best healing item (Medkit first)
         medkit = _find_healing_item(inventory, critical=True)
         if medkit:
             log.warning("💚 CRITICAL HP=%d! Using %s", hp, medkit.get('typeId', 'heal'))
             return {"action": "use_item", "data": {"itemId": medkit["id"]},
                     "reason": f"CRITICAL HP: {hp} -> healing"}
     
-    # Low HP (below 60%): Heal if safe
     elif hp_status["status"] == "low":
         if not enemies_nearby and not in_deathzone:
             heal = _find_healing_item(inventory, critical=False, prefer_small=True)
@@ -272,7 +267,6 @@ def _manage_ep(ep: int, max_ep: int, inventory: list, enemies_nearby: bool,
     """Manage EP - rest or use energy drink if below 60%."""
     ep_status = _check_ep_status(ep, max_ep)
     
-    # Critical EP: Must recover immediately
     if ep_status["status"] == "critical":
         energy_drink = _find_energy_drink(inventory)
         if energy_drink:
@@ -280,18 +274,15 @@ def _manage_ep(ep: int, max_ep: int, inventory: list, enemies_nearby: bool,
             return {"action": "use_item", "data": {"itemId": energy_drink["id"]},
                     "reason": f"CRITICAL EP: {ep}/{max_ep} -> restore"}
         
-        # No energy drink, need to rest or flee to safe zone
         if not enemies_nearby and not in_deathzone:
             return {"action": "rest", "data": {},
                     "reason": f"CRITICAL EP: {ep}/{max_ep} -> resting"}
         else:
-            # Flee to safe region
             safe = _find_safe_region(connections, danger_ids, view)
             if safe:
                 return {"action": "move", "data": {"regionId": safe},
                         "reason": f"EP CRITICAL: fleeing to safe region"}
     
-    # Low EP (below 60%): Recover if safe
     elif ep_status["status"] == "low":
         energy_drink = _find_energy_drink(inventory)
         if energy_drink and ep / max_ep < 0.5:
@@ -311,9 +302,7 @@ def _manage_ep(ep: int, max_ep: int, inventory: list, enemies_nearby: bool,
 # =========================
 
 def _check_equip_best_weapon(inventory: list, equipped) -> dict | None:
-    """Auto-equip best weapon for maximum ATK.
-    v2.0.0: ALWAYS prioritize high ATK weapons.
-    """
+    """Auto-equip best weapon for maximum ATK."""
     current_bonus = get_weapon_bonus(equipped) if equipped else 0
     current_priority = get_weapon_priority(equipped) if equipped else 0
     
@@ -329,7 +318,6 @@ def _check_equip_best_weapon(inventory: list, equipped) -> dict | None:
             bonus = WEAPONS.get(type_id, {}).get("bonus", 0)
             priority = WEAPONS.get(type_id, {}).get("priority", 0)
             
-            # Prioritize higher ATK bonus
             if priority > best_priority or (priority == best_priority and bonus > best_bonus):
                 best = item
                 best_bonus = bonus
@@ -343,23 +331,32 @@ def _check_equip_best_weapon(inventory: list, equipped) -> dict | None:
     return None
 
 
-def _should_upgrade_weapon(current_weapon: dict, available_weapons: list) -> bool:
-    """Check if there's a better weapon available."""
-    current_priority = get_weapon_priority(current_weapon) if current_weapon else 0
-    
-    for weapon in available_weapons:
-        if not isinstance(weapon, dict):
+# =========================
+# 🧠 SMOLTZ MANAGEMENT (v2.0.1 - Auto claim from inventory)
+# =========================
+
+def _claim_smoltz_from_inventory(inventory: list) -> dict | None:
+    """Claim currency items from inventory to add to sMOLTZ total.
+    v2.0.1: Fix for sMOLTZ not showing in UI - need to USE currency items.
+    """
+    for item in inventory:
+        if not isinstance(item, dict):
             continue
-        w_type = weapon.get("typeId", "").lower()
-        w_priority = WEAPONS.get(w_type, {}).get("priority", 0)
-        if w_priority > current_priority:
-            return True
-    return False
+        
+        name = item.get("name", "").lower()
+        type_id = item.get("typeId", "").lower()
+        category = item.get("category", "").lower()
+        
+        # Check for any currency-related item
+        if "moltz" in name or "smoltz" in name or type_id == "rewards" or category == "currency":
+            amount = item.get("amount", 50)
+            log.info("💰💰💰 CLAIMING SMOLTZ from inventory: %s (+%d sMOLTZ!)", 
+                    item.get("name", "currency"), amount)
+            return {"action": "use_item", "data": {"itemId": item["id"]},
+                    "reason": f"💰 CLAIM SMOLTZ: Converting +{amount} to wallet!"}
+    
+    return None
 
-
-# =========================
-# 🧠 SMOLTZ FARMING (v2.0.0 - SMOLTZ first, weakest enemy first)
-# =========================
 
 def _pickup_smoltz_first(items: list, inventory: list, region_id: str) -> dict | None:
     """PICKUP SMOLTZ FIRST - Highest priority in v2.0.0."""
@@ -373,7 +370,8 @@ def _pickup_smoltz_first(items: list, inventory: list, region_id: str) -> dict |
     # Currency items = SMOLTZ - ABSOLUTE HIGHEST PRIORITY
     currency_items = [i for i in local_items 
                       if i.get("typeId", "").lower() == "rewards" 
-                      or i.get("category", "").lower() == "currency"]
+                      or i.get("category", "").lower() == "currency"
+                      or "moltz" in i.get("name", "").lower()]
     
     if currency_items:
         best_currency = max(currency_items, key=lambda i: i.get("amount", 1))
@@ -395,10 +393,12 @@ def _pickup_smoltz_first(items: list, inventory: list, region_id: str) -> dict |
     return None
 
 
+# =========================
+# 🧠 COMBAT & TARGET SELECTION (v2.0.0 - Weakest first)
+# =========================
+
 def _select_weakest_enemy_first(enemies: list) -> dict | None:
-    """Select enemy with LOWEST HP first.
-    v2.0.0: Primary combat strategy - quick kills = more sMoltz!
-    """
+    """Select enemy with LOWEST HP first."""
     if not enemies:
         return None
     
@@ -406,7 +406,6 @@ def _select_weakest_enemy_first(enemies: list) -> dict | None:
     if not alive_enemies:
         return None
     
-    # Sort by HP ascending (weakest first)
     weakest = min(alive_enemies, key=lambda e: e.get("hp", 999))
     log.debug("🎯 WEAKEST FIRST: Enemy HP=%d", weakest.get("hp", 0))
     return weakest
@@ -570,19 +569,20 @@ def _track_smoltz_gain(view: dict, my_id: str):
 
 def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict | None:
     """
-    Main decision engine - ULTIMATE SMOLTZ FARMING MODE v2.0.0
+    Main decision engine - ULTIMATE SMOLTZ FARMING MODE v2.0.1
     
     PRIORITY CHAIN:
     1. DEATHZONE ESCAPE (survival first)
     2. HP MAINTENANCE (keep >60%)
     3. EP MAINTENANCE (keep >60%)
-    4. PICKUP SMOLTZ (highest priority!)
-    5. EQUIP BEST WEAPON (max ATK)
-    6. GUARDIAN FARMING (weakest first - 120 sMoltz!)
-    7. FINISH LOW HP ENEMIES (quick kills)
-    8. WEAKEST ENEMY FIRST (primary combat)
-    9. WEAKEST MONSTER FARMING
-    10. MOVE TO RICH REGIONS
+    4. CLAIM SMOLTZ FROM INVENTORY (NEW! v2.0.1)
+    5. PICKUP SMOLTZ (highest priority!)
+    6. EQUIP BEST WEAPON (max ATK)
+    7. GUARDIAN FARMING (weakest first - 120 sMoltz!)
+    8. FINISH LOW HP ENEMIES (quick kills)
+    9. WEAKEST ENEMY FIRST (primary combat)
+    10. WEAKEST MONSTER FARMING
+    11. MOVE TO RICH REGIONS
     """
     self_data = view.get("self", {})
     region = view.get("currentRegion", {})
@@ -688,12 +688,17 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     # FREE ACTIONS (no cooldown)
     # ═══════════════════════════════════════════════════════════════
     
-    # PRIORITY 4: PICKUP SMOLTZ FIRST!
+    # PRIORITY 4: CLAIM SMOLTZ FROM INVENTORY (v2.0.1 FIX!)
+    claim_action = _claim_smoltz_from_inventory(inventory)
+    if claim_action:
+        return claim_action
+    
+    # PRIORITY 5: PICKUP SMOLTZ FIRST!
     pickup_action = _pickup_smoltz_first(visible_items, inventory, region_id)
     if pickup_action:
         return pickup_action
     
-    # PRIORITY 5: EQUIP BEST WEAPON (max ATK)
+    # PRIORITY 6: EQUIP BEST WEAPON (max ATK)
     equip_action = _check_equip_best_weapon(inventory, equipped)
     if equip_action:
         return equip_action
@@ -711,7 +716,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     can_fight = ep_status["can_fight"] and hp >= FARMING_HP_MIN
     
     # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 6: GUARDIAN FARMING (120 sMoltz - WEAKEST FIRST!)
+    # PRIORITY 7: GUARDIAN FARMING (120 sMoltz - WEAKEST FIRST!)
     # ═══════════════════════════════════════════════════════════════
     guardians = [a for a in visible_agents
                  if a.get("isGuardian", False) and a.get("isAlive", True)]
@@ -722,7 +727,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             w_range = get_weapon_range(equipped)
             if _is_in_range(target, region_id, w_range, connections):
                 enemy_hp = target.get("hp", 100)
-                # Fight if we can win OR guardian is low HP
                 if enemy_hp < 50 or total_atk >= 30:
                     log.info("🎯🎯🎯 GUARDIAN HUNT! +120 sMoltz! Enemy HP=%d, My ATK=%d", enemy_hp, total_atk)
                     return {"action": "attack",
@@ -730,7 +734,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                             "reason": f"💰💰💰 GUARDIAN: 120 sMoltz! HP={enemy_hp}"}
     
     # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 7: FINISH LOW HP ENEMIES (quick kills)
+    # PRIORITY 8: FINISH LOW HP ENEMIES (quick kills)
     # ═══════════════════════════════════════════════════════════════
     low_hp_enemies = [a for a in visible_agents
                       if not a.get("isGuardian", False) 
@@ -750,7 +754,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                         "reason": f"FINISH: Low HP enemy! +{PLAYER_KILL_SMOLTZ} sMoltz"}
     
     # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 8: WEAKEST ENEMY FIRST (primary combat strategy)
+    # PRIORITY 9: WEAKEST ENEMY FIRST (primary combat strategy)
     # ═══════════════════════════════════════════════════════════════
     enemies = [a for a in visible_agents
                if not a.get("isGuardian", False) and a.get("isAlive", True)
@@ -774,7 +778,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                             "reason": f"WEAKEST FIRST: HP={enemy_hp}"}
     
     # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 9: WEAKEST MONSTER FARMING
+    # PRIORITY 10: WEAKEST MONSTER FARMING
     # ═══════════════════════════════════════════════════════════════
     monsters = [m for m in visible_monsters if m.get("hp", 0) > 0]
     if monsters and can_fight and hp >= 25:
@@ -789,7 +793,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                         "reason": f"MONSTER FARM: HP={monster_hp}"}
     
     # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 10: HEALING (if HP below 60% and no enemies)
+    # PRIORITY 11: HEALING (if HP below 60% and no enemies)
     # ═══════════════════════════════════════════════════════════════
     if hp < HP_SAFE_THRESHOLD and not enemies_nearby and not in_deathzone:
         heal = _find_healing_item(inventory, critical=(hp < 30), prefer_small=(hp < 50))
@@ -798,10 +802,9 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "reason": f"HP MAINTENANCE: {hp} -> target >60%"}
     
     # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 11: MOVE TO FIND MORE SMOLTZ
+    # PRIORITY 12: MOVE TO FIND MORE SMOLTZ
     # ═══════════════════════════════════════════════════════════════
     if ep >= move_ep_cost and connections:
-        # Try to move to region with guardians or items
         move_target = None
         
         # Look for regions with guardians
@@ -817,7 +820,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     break
         
         if not move_target:
-            # Fallback: any safe region
             move_target = _find_safe_region(connections, danger_ids, view)
         
         if move_target:
@@ -836,7 +838,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
 """
 ================================================================================
-v2.0.0 - ULTIMATE SMOLTZ FARMING BOT
+v2.0.1 - ULTIMATE SMOLTZ FARMING BOT (WITH CLAIM FIX)
 ================================================================================
 
 KEY FEATURES:
@@ -844,41 +846,45 @@ KEY FEATURES:
 1. HIGH ATK PRIORITY:
    - Always equip the best weapon available
    - Prioritize weapon pickups (Katana > Sniper > Sword)
-   - Fight only when ATK is sufficient
 
 2. HP/EP MAINTENANCE (always above 60%):
    - Auto-heal when HP < 60%
    - Auto-rest or use energy drink when EP < 60%
-   - Critical recovery when HP < 30% or EP < 30%
 
-3. SMOLTZ FIRST:
-   - Pickup currency items IMMEDIATELY (highest priority)
+3. SMOLTZ FIRST with AUTO-CLAIM:
+   - Pickup currency items IMMEDIATELY
+   - AUTO-CLAIM sMOLTZ from inventory (FIXED in v2.0.1!)
    - Hunt guardians (120 sMoltz each) - weakest first
-   - Finish low HP players (100 sMoltz)
 
 4. WEAKEST ENEMY FIRST:
    - Primary combat strategy: target lowest HP enemies
    - Quick kills = more sMoltz per hour
-   - Less EP wasted on prolonged fights
 
-PRIORITY CHAIN:
---------------
-1. DEATHZONE ESCAPE (survival)
+PRIORITY CHAIN (v2.0.1):
+-----------------------
+1. DEATHZONE ESCAPE
 2. HP MAINTENANCE (>60%)
 3. EP MAINTENANCE (>60%)
-4. PICKUP SMOLTZ
-5. EQUIP BEST WEAPON
-6. GUARDIAN FARMING (weakest)
-7. FINISH LOW HP ENEMIES
-8. WEAKEST ENEMY FIRST
-9. MONSTER FARMING (weakest)
-10. MOVE FOR SMOLTZ
-11. REST
+4. CLAIM SMOLTZ FROM INVENTORY (NEW!)
+5. PICKUP SMOLTZ
+6. EQUIP BEST WEAPON
+7. GUARDIAN FARMING (weakest)
+8. FINISH LOW HP ENEMIES
+9. WEAKEST ENEMY FIRST
+10. MONSTER FARMING (weakest)
+11. MOVE FOR SMOLTZ
+12. REST
 
 EXPORTED FUNCTIONS:
 ------------------
 - decide_action() - Main decision engine
 - reset_game_state() - Reset per-game tracking
 - learn_from_map() - Learn map layout
+
+CHANGES IN v2.0.1:
+-----------------
+- Added _claim_smoltz_from_inventory() function
+- Fixed issue where sMOLTZ from $Moltz items wasn't showing in UI
+- Bot will now automatically USE currency items to convert to sMOLTZ
 ================================================================================
 """
