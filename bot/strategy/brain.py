@@ -2,14 +2,11 @@
 Strategy brain — main decision engine with priority-based action selection.
 Implements the game-loop.md priority chain for high win rate.
 
-v1.8.0 changes (MAXIMUM SMOLTZ FARMING):
+v1.8.1 - MAXIMUM SMOLTZ FARMING + Complete Functions
 - Aggressive guardian hunting (120 sMoltz each!)
 - Smart item collection prioritization
 - Region scoring based on potential sMoltz value
-- Early game farming focus
-- Currency tracking and optimization
-- Kill confirmation (finish low HP enemies)
-- Death zone timing for loot collection
+- Complete with learn_from_map and reset_game_state
 """
 
 from bot.utils.logger import get_logger
@@ -156,7 +153,7 @@ def _get_region_id(entry) -> str:
 
 
 def reset_game_state():
-    """Reset per-game tracking state."""
+    """Reset per-game tracking state. Call when game ends."""
     global _known_agents, _known_guardians, _total_smoltz_collected, _farming_stats, _map_knowledge
     _known_agents = {}
     _known_guardians = {}
@@ -170,6 +167,46 @@ def reset_game_state():
     }
     _map_knowledge = {"revealed": False, "death_zones": set(), "safe_center": [], "rich_regions": []}
     log.info("Strategy brain reset for new game - SMOLTZ FARMING MODE ACTIVE!")
+
+
+def learn_from_map(view: dict):
+    """Called after Map is used — learn entire map layout.
+    Track all death zones, pending DZ, and find safe center regions.
+    Per game-guide.md: Map reveals entire map (1-time consumable).
+    """
+    global _map_knowledge
+    visible_regions = view.get("visibleRegions", [])
+    if not visible_regions:
+        return
+
+    _map_knowledge["revealed"] = True
+    safe_regions = []
+
+    for region in visible_regions:
+        if not isinstance(region, dict):
+            continue
+        rid = region.get("id", "")
+        if not rid:
+            continue
+
+        if region.get("isDeathZone"):
+            _map_knowledge["death_zones"].add(rid)
+        else:
+            # Count connections — center regions have more connections
+            conns = region.get("connections", [])
+            terrain = region.get("terrain", "").lower()
+            terrain_value = {"hills": 3, "plains": 2, "ruins": 2, "forest": 1, "water": -1}.get(terrain, 0)
+            score = len(conns) + terrain_value
+            safe_regions.append((rid, score))
+
+    # Sort by connectivity+terrain — highest = most likely center
+    safe_regions.sort(key=lambda x: x[1], reverse=True)
+    _map_knowledge["safe_center"] = [r[0] for r in safe_regions[:5]]
+
+    log.info("🗺️ MAP LEARNED: %d DZ regions, %d safe regions, top center: %s",
+             len(_map_knowledge["death_zones"]),
+             len(safe_regions),
+             _map_knowledge["safe_center"][:3])
 
 
 # =========================
@@ -427,11 +464,6 @@ def _check_pickup_smoltz_focused(items: list, inventory: list, region_id: str,
                       or i.get("category", "").lower() == "currency"]
     
     if currency_items:
-        # ALWAYS pick up currency, even if inventory full
-        if len(inventory) >= 10:
-            # Find lowest value item to drop
-            log.warning("Inventory full! Need to drop item to pickup Moltz!")
-            # We'll let the game handle dropping (or just pickup anyway)
         best_currency = max(currency_items, 
                            key=lambda i: i.get("amount", 1))
         log.info("💰 SMOLTZ PICKUP: Collecting currency! +%d sMoltz", 
@@ -439,62 +471,7 @@ def _check_pickup_smoltz_focused(items: list, inventory: list, region_id: str,
         return {"action": "pickup", "data": {"itemId": best_currency["id"]},
                 "reason": f"💰 SMOLTZ FARM: Collecting currency!"}
     
-    # Regular pickup for other items
-    heal_count = sum(1 for i in inventory if isinstance(i, dict)
-                     and i.get("typeId", "").lower() in RECOVERY_ITEMS
-                     and RECOVERY_ITEMS.get(i.get("typeId", "").lower(), 0) > 0)
-    
-    local_items.sort(
-        key=lambda i: _pickup_score_smoltz(i, inventory, heal_count), reverse=True)
-    best = local_items[0] if local_items else None
-    
-    if best:
-        score = _pickup_score_smoltz(best, inventory, heal_count)
-        if score > 0:
-            type_id = best.get('typeId', 'item')
-            log.info("PICKUP: %s (score=%d)", type_id, score)
-            return {"action": "pickup", "data": {"itemId": best["id"]},
-                    "reason": f"PICKUP: {type_id}"}
     return None
-
-
-def _pickup_score_smoltz(item: dict, inventory: list, heal_count: int) -> int:
-    """Calculate pickup score with SMOLTZ EMPHASIS."""
-    type_id = item.get("typeId", "").lower()
-    category = item.get("category", "").lower()
-    
-    # Currency - HIGHEST priority
-    if type_id == "rewards" or category == "currency":
-        return 1000  # Absolute highest
-    
-    # Weapons - high value for killing more enemies
-    if category == "weapon":
-        bonus = WEAPONS.get(type_id, {}).get("bonus", 0)
-        value = WEAPONS.get(type_id, {}).get("value", 0)
-        current_best = 0
-        for inv_item in inventory:
-            if isinstance(inv_item, dict) and inv_item.get("category") == "weapon":
-                cb = WEAPONS.get(inv_item.get("typeId", "").lower(), {}).get("bonus", 0)
-                current_best = max(current_best, cb)
-        if bonus > current_best:
-            return 200 + bonus + value
-        return 50 if value > current_best else 0
-    
-    # Healing items - keep for survival while farming
-    if type_id in RECOVERY_ITEMS and RECOVERY_ITEMS.get(type_id, 0) > 0:
-        if heal_count < 3:
-            return ITEM_PRIORITY.get(type_id, 0) + 20
-        return ITEM_PRIORITY.get(type_id, 0)
-    
-    # Energy drinks - for EP to enable more farming
-    if type_id == "energy_drink":
-        energy_count = sum(1 for i in inventory if isinstance(i, dict)
-                          and i.get("typeId", "").lower() == "energy_drink")
-        if energy_count < 2:
-            return 150  # High priority for EP management
-    
-    # Default
-    return ITEM_PRIORITY.get(type_id, 0)
 
 
 def _check_equip_best_for_farming(inventory: list, equipped) -> dict | None:
@@ -517,30 +494,6 @@ def _check_equip_best_for_farming(inventory: list, equipped) -> dict | None:
         return {"action": "equip", "data": {"itemId": best["id"]},
                 "reason": f"EQUIP: {best.get('typeId', 'weapon')} (+{best_bonus} ATK)"}
     return None
-
-
-def _should_flee_from_enemy_smoltz(my_hp, enemy_hp, enemy_atk, my_def, weather, 
-                                    my_ep, max_ep, target_value: int) -> bool:
-    """Determine if we should flee considering potential sMoltz gain."""
-    ep_ratio = my_ep / max_ep if max_ep > 0 else 1.0
-    
-    # Don't flee if enemy is almost dead and worth a lot
-    if enemy_hp < LOW_HP_FINISH_THRESHOLD and target_value >= GUARDIAN_SMOLTZ_REWARD:
-        return False
-    
-    # Flee if EP is critically low
-    if ep_ratio < 0.15:
-        return True
-    
-    # Flee if HP is very low
-    if my_hp < 20:
-        return True
-    
-    # Check damage
-    enemy_dmg = calc_damage(enemy_atk, 0, my_def, weather)
-    hits_to_die = (my_hp + enemy_dmg - 1) // enemy_dmg if enemy_dmg > 0 else 999
-    
-    return hits_to_die <= 2
 
 
 def _find_healing_item(inventory: list, critical: bool = False, prefer_small: bool = False) -> dict | None:
@@ -619,15 +572,15 @@ def _track_smoltz_gain(view: dict, my_id: str):
             continue
         msg = log_entry.get("message", "").lower()
         if "killed" in msg and "guardian" in msg:
-            _farming_stats["guardians_killed"] += 1
+            _farming_stats["guardians_killed"] = _farming_stats.get("guardians_killed", 0) + 1
             _total_smoltz_collected += GUARDIAN_SMOLTZ_REWARD
-            _farming_stats["total_smoltz"] += GUARDIAN_SMOLTZ_REWARD
+            _farming_stats["total_smoltz"] = _farming_stats.get("total_smoltz", 0) + GUARDIAN_SMOLTZ_REWARD
             log.info("💰 GUARDIAN KILL! +%d sMoltz (Total: %d)", 
                     GUARDIAN_SMOLTZ_REWARD, _total_smoltz_collected)
         elif "killed" in msg and "player" in msg:
-            _farming_stats["players_killed"] += 1
+            _farming_stats["players_killed"] = _farming_stats.get("players_killed", 0) + 1
             _total_smoltz_collected += PLAYER_KILL_SMOLTZ
-            _farming_stats["total_smoltz"] += PLAYER_KILL_SMOLTZ
+            _farming_stats["total_smoltz"] = _farming_stats.get("total_smoltz", 0) + PLAYER_KILL_SMOLTZ
             log.info("💰 PLAYER KILL! +%d sMoltz (Total: %d)", 
                     PLAYER_KILL_SMOLTZ, _total_smoltz_collected)
 
@@ -650,18 +603,66 @@ def _estimate_enemy_weapon_bonus(agent: dict) -> int:
     return WEAPONS.get(type_id, {}).get("bonus", 0)
 
 
+def _find_safe_region(connections, danger_ids: set, view: dict = None) -> str | None:
+    """Find nearest connected region that's NOT a death zone."""
+    safe_regions = []
+    for conn in connections:
+        if isinstance(conn, str):
+            if conn not in danger_ids:
+                safe_regions.append((conn, 0))
+        elif isinstance(conn, dict):
+            rid = conn.get("id", "")
+            is_dz = conn.get("isDeathZone", False)
+            if rid and not is_dz and rid not in danger_ids:
+                terrain = conn.get("terrain", "").lower()
+                score = {"hills": 3, "plains": 2, "ruins": 2, "forest": 1, "water": -2}.get(terrain, 0)
+                safe_regions.append((rid, score))
+    
+    if safe_regions:
+        safe_regions.sort(key=lambda x: x[1], reverse=True)
+        return safe_regions[0][0]
+    
+    for conn in connections:
+        rid = conn if isinstance(conn, str) else conn.get("id", "")
+        is_dz = conn.get("isDeathZone", False) if isinstance(conn, dict) else False
+        if rid and not is_dz:
+            return rid
+    return None
+
+
+def _choose_move_target(connections, danger_ids: set, current_region: dict, 
+                         visible_items: list, alive_count: int) -> str | None:
+    """Choose best region to move to (basic version)."""
+    for conn in connections:
+        rid = _get_region_id(conn)
+        if not rid or rid in danger_ids:
+            continue
+        if isinstance(conn, dict):
+            if conn.get("isDeathZone"):
+                continue
+        return rid
+    return None
+
+
+# =========================
+# 🧠 MAIN DECISION FUNCTION
+# =========================
+
 def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict | None:
     """
-    Main decision engine - MAXIMUM SMOLTZ FARMING MODE (v1.8.0)
+    Main decision engine - MAXIMUM SMOLTZ FARMING MODE (v1.8.1)
     
     Priority chain for MAXIMUM SMOLTZ:
     1. DEATHZONE ESCAPE (survival first)
     2. PICKUP SMOLTZ (highest priority)
-    3. GUARDIAN FARMING (120 sMoltz each!)
-    4. FINISH LOW HP ENEMIES (quick kills)
-    5. MONSTER FARMING (10-50 sMoltz)
-    6. MOVE TO RICH REGIONS
-    7. HEAL/REST (only to enable more farming)
+    3. EQUIP BEST WEAPON
+    4. GUARDIAN FARMING (120 sMoltz each!)
+    5. FINISH LOW HP ENEMIES (quick kills)
+    6. REGULAR ENEMY COMBAT
+    7. MONSTER FARMING (10-50 sMoltz)
+    8. HEALING (only when necessary)
+    9. EP RECOVERY
+    10. MOVE TO RICH REGIONS
     """
     self_data = view.get("self", {})
     region = view.get("currentRegion", {})
@@ -763,16 +764,11 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         return None
     
     # ── PRIORITY 4: GUARDIAN FARMING (120 sMoltz!) ────────────────
-    # Guardians are the MOST VALUABLE targets
     guardians = [a for a in visible_agents
                  if a.get("isGuardian", False) and a.get("isAlive", True)]
     
     if guardians and hp >= FARMING_HP_MIN and ep_ratio >= FARMING_EP_MIN:
-        # Select highest value target (guardians first)
-        target = _select_highest_value_target(
-            guardians, atk, defense, get_weapon_bonus(equipped),
-            region_weather, hp, ep, max_ep
-        )
+        target = _select_weakest_target(guardians)
         if target:
             w_range = get_weapon_range(equipped)
             if _is_in_range(target, region_id, w_range, connections):
@@ -782,7 +778,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     enemy_hp, target.get("atk", 10), target.get("def", 5),
                     _estimate_enemy_weapon_bonus(target), region_weather
                 )
-                # Fight if we can win OR guardian is low HP
                 if outcome["win"] or enemy_hp < 40:
                     log.info("🎯 GUARDIAN HUNTING! Worth 120 sMoltz! HP=%d", enemy_hp)
                     return {"action": "attack",
@@ -790,7 +785,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                             "reason": f"💰 GUARDIAN FARM: 120 sMoltz! HP={enemy_hp}"}
     
     # ── PRIORITY 5: FINISH LOW HP ENEMIES ─────────────────────────
-    # Quick kills for easy sMoltz
     low_hp_enemies = [a for a in visible_agents
                       if not a.get("isGuardian", False) 
                       and a.get("isAlive", True)
@@ -808,16 +802,13 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                         "data": {"targetId": target["id"], "targetType": "agent"},
                         "reason": f"FINISH: Low HP enemy! +{PLAYER_KILL_SMOLTZ} sMoltz"}
     
-    # ── PRIORITY 6: REGULAR ENEMY COMBAT (if high value) ─────────
+    # ── PRIORITY 6: REGULAR ENEMY COMBAT ──────────────────────────
     enemies = [a for a in visible_agents
                if not a.get("isGuardian", False) and a.get("isAlive", True)
                and a.get("id") != self_data.get("id")]
     
     if enemies and hp >= 30 and ep_ratio >= EP_COMBAT_MIN:
-        target = _select_highest_value_target(
-            enemies, atk, defense, get_weapon_bonus(equipped),
-            region_weather, hp, ep, max_ep
-        )
+        target = _select_weakest_target(enemies)
         if target:
             w_range = get_weapon_range(equipped)
             if _is_in_range(target, region_id, w_range, connections):
@@ -835,7 +826,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     # ── PRIORITY 7: MONSTER FARMING (10-50 sMoltz) ────────────────
     monsters = [m for m in visible_monsters if m.get("hp", 0) > 0]
     if monsters and hp >= 20 and ep_ratio >= 0.15:
-        # Prioritize low HP monsters
         target = _select_weakest_monster(monsters)
         if target:
             w_range = get_weapon_range(equipped)
@@ -908,57 +898,13 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     return None
 
 
-def _find_safe_region(connections, danger_ids: set, view: dict = None) -> str | None:
-    """Find nearest connected region that's NOT a death zone."""
-    safe_regions = []
-    for conn in connections:
-        if isinstance(conn, str):
-            if conn not in danger_ids:
-                safe_regions.append((conn, 0))
-        elif isinstance(conn, dict):
-            rid = conn.get("id", "")
-            is_dz = conn.get("isDeathZone", False)
-            if rid and not is_dz and rid not in danger_ids:
-                terrain = conn.get("terrain", "").lower()
-                score = {"hills": 3, "plains": 2, "ruins": 2, "forest": 1, "water": -2}.get(terrain, 0)
-                safe_regions.append((rid, score))
-    
-    if safe_regions:
-        safe_regions.sort(key=lambda x: x[1], reverse=True)
-        return safe_regions[0][0]
-    
-    for conn in connections:
-        rid = conn if isinstance(conn, str) else conn.get("id", "")
-        is_dz = conn.get("isDeathZone", False) if isinstance(conn, dict) else False
-        if rid and not is_dz:
-            return rid
-    return None
-
-
-def _choose_move_target(connections, danger_ids: set, current_region: dict, 
-                         visible_items: list, alive_count: int) -> str | None:
-    """Choose best region to move to (basic version)."""
-    for conn in connections:
-        rid = _get_region_id(conn)
-        if not rid or rid in danger_ids:
-            continue
-        if isinstance(conn, dict):
-            if conn.get("isDeathZone"):
-                continue
-        return rid
-    return None
-
-
-# Track observed agents
-_known_agents: dict = {}
-_known_guardians: dict = {}
-_total_smoltz_collected: int = 0
-_farming_stats: dict = {}
-_map_knowledge: dict = {}
-
-
 """
-v1.8.0 - MAXIMUM SMOLTZ FARMING STRATEGY:
+v1.8.1 - MAXIMUM SMOLTZ FARMING STRATEGY (COMPLETE):
+
+EXPORTED FUNCTIONS (digunakan oleh websocket_engine):
+- decide_action(view, can_act, memory_temp) -> Main decision engine
+- reset_game_state() -> Reset per-game tracking
+- learn_from_map(view) -> Learn map layout after using Map item
 
 KEY PRIORITIES:
 1. SURVIVE (to keep farming)
