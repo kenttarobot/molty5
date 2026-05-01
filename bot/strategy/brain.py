@@ -1,21 +1,55 @@
 """
-Strategy brain — BERSERKER MODE v2.3 (FIX FACILITY LOOP)
-===========================================================
-PERBAIKAN:
-- FIX: Bot tidak akan stuck di facility (broadcast_station)
-- PRIORITAS: Combat > Facility > Movement
-- Tambahan: Batasi interact facility yang sama
-"""
+Strategy brain — main decision engine with priority-based action selection.
+Implements the game-loop.md priority chain for high win rate.
 
+v1.5.2 changes:
+- Guardians now ATTACK player agents directly (hostile combatants)
+- Curse is TEMPORARILY DISABLED (no whisper Q&A flow)
+- Free room: 5 guardians (reduced from 30), each drops 120 sMoltz
+- connectedRegions: either full Region objects OR bare string IDs — type-check!
+- pendingDeathzones: entries are {id, name} objects
+
+Uses ALL view fields from api-summary.md:
+- self: agent stats, inventory, equipped weapon
+- currentRegion: terrain, weather, connections, facilities
+- connectedRegions: adjacent regions (full Region object when visible, bare string ID when out-of-vision)
+- visibleRegions: all regions in vision range
+- visibleAgents: other agents (players + guardians — guardians are HOSTILE)
+- visibleMonsters: monsters
+- visibleNPCs: NPCs (flavor — safe to ignore per game-systems.md)
+- visibleItems: ground items in visible regions
+- pendingDeathzones: regions becoming death zones next ({id, name} entries)
+- recentLogs: recent gameplay events
+- recentMessages: regional/private/broadcast messages
+- aliveCount: remaining alive agents
+"""
 from bot.utils.logger import get_logger
 
 log = get_logger(__name__)
 
 
 # =========================
-# 🔥 KONFIGURASI BERSERKER v2.3
+# 🔥 HYBRID AI LAYER (INJECTED)
 # =========================
+import os, json
+USE_LLM = bool(os.getenv("OPENAI_API_KEY"))
+STRATEGY = {"mode": "balanced", "risk": 0.5}
+TURN_COUNTER = 0
 
+def ask_llm_strategy(view):
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": f"HP:{view['self']['hp']} EP:{view['self']['ep']} Alive:{view.get('aliveCount')} Enemies:{len(view.get('visibleAgents', []))}"}],
+        )
+        return {"mode": "aggressive" if "attack" in res.choices[0].message.content.lower() else "balanced", "risk": 0.5}
+    except:
+        return {"mode": "balanced", "risk": 0.5}
+
+
+# ── Weapon stats from combat-items.md ─────────────────────────────────
 WEAPONS = {
     "fist": {"bonus": 0, "range": 0},
     "dagger": {"bonus": 10, "range": 0},
@@ -28,76 +62,719 @@ WEAPONS = {
 
 WEAPON_PRIORITY = ["katana", "sniper", "sword", "pistol", "dagger", "bow", "fist"]
 
+# ── Item priority for pickup ──────────────────────────────────────────
+# Moltz = ALWAYS pickup (highest). Weapons > healing > utility.
+# Binoculars = passive (vision+1 just by holding), always pickup.
 ITEM_PRIORITY = {
-    "rewards": 300,
+    "rewards": 300,  # Moltz/sMoltz — ALWAYS pickup first
     "katana": 100, "sniper": 95, "sword": 90, "pistol": 85,
     "dagger": 80, "bow": 75,
     "medkit": 70, "bandage": 65, "emergency_food": 60, "energy_drink": 58,
-    "binoculars": 55,
-    "map": 52,
+    "binoculars": 55,  # Passive: vision +1 permanent, always pickup
+    "map": 52,          # Use immediately to reveal entire map
     "megaphone": 40,
 }
 
+# ── Recovery items for healing (combat-items.md) ──────────────────────
+# For normal healing (HP<70): prefer Emergency Food (save Bandage/Medkit)
+# For critical healing (HP<30): prefer Bandage then Medkit
 RECOVERY_ITEMS = {
     "medkit": 50, "bandage": 30, "emergency_food": 20,
-    "energy_drink": 0,
+    "energy_drink": 0,  # EP restore, not HP
 }
 
+# Weather combat penalty per game-systems.md
 WEATHER_COMBAT_PENALTY = {
     "clear": 0.0,
-    "rain": 0.05,
-    "fog": 0.10,
-    "storm": 0.15,
+    "rain": 0.05,   # -5%
+    "fog": 0.10,    # -10%
+    "storm": 0.15,  # -15%
 }
 
-# ── BERSERKER THRESHOLDS v2.3 ────────────────────────────────────────
-BERSERKER_CONFIG = {
-    "HEAL_CRITICAL": 25,
-    "HEAL_URGENT": 35,
-    "HEAL_MODERATE": 50,
-    "FLEE_HP": 20,
-    "FLEE_OUTNUMBERED": 4,
-    "FLEE_STRONG_ENEMY": 30,
-    "MIN_HP_TO_ATTACK": 35,
-    "EP_MIN_ATTACK": 0.20,
-    "EP_SAFE": 0.15,
-    
-    # Hunting mode
-    "HUNTING_MODE": True,
-    "HUNT_UNTIL_DEATH": True,
-    "TARGET_MARK_DURATION": 10,
-    "WOUNDED_HP_THRESHOLD": 50,
-    "LOW_HP_PRIORITY": 40,
-    "EXECUTE_PRIORITY": 30,
-    
-    # ── BARU: Facility cooldown ─────────────────────────────────────
-    "MAX_FACILITY_INTERACTIONS": 1,      # Maksimal 1x interact per facility
-    "FACILITY_COOLDOWN_TURNS": 10,       # Cooldown 10 turn sebelum interact lagi
-}
+
+def calc_damage(atk: int, weapon_bonus: int, target_def: int,
+                weather: str = "clear") -> int:
+    """Damage formula per combat-items.md + game-systems.md weather penalty.
+    Base: ATK + bonus - (DEF * 0.5), min 1.
+    Weather: clear=0%, rain=-5%, fog=-10%, storm=-15%.
+    """
+    base = atk + weapon_bonus - int(target_def * 0.5)
+    penalty = WEATHER_COMBAT_PENALTY.get(weather, 0.0)
+    return max(1, int(base * (1 - penalty)))
+
+
+def get_weapon_bonus(equipped_weapon) -> int:
+    """Get ATK bonus from equipped weapon."""
+    if not equipped_weapon:
+        return 0
+    type_id = equipped_weapon.get("typeId", "").lower()
+    return WEAPONS.get(type_id, {}).get("bonus", 0)
+
+
+def get_weapon_range(equipped_weapon) -> int:
+    """Get range from equipped weapon."""
+    if not equipped_weapon:
+        return 0
+    type_id = equipped_weapon.get("typeId", "").lower()
+    return WEAPONS.get(type_id, {}).get("range", 0)
 
 _known_agents: dict = {}
+# Map knowledge: track all revealed DZ/pending DZ/safe regions after using Map
 _map_knowledge: dict = {"revealed": False, "death_zones": set(), "safe_center": []}
-_hunting_target: dict = None
-_hunting_timer: int = 0
 
-# ── BARU: Track facility yang sudah di-interact ──────────────────────
-_interacted_facilities: dict = {}  # {facility_id: turn_interacted}
+
+def _resolve_region(entry, view: dict):
+    """Resolve a connectedRegions entry to a full region object.
+    Per v1.5.2 gotchas.md §3: entries are EITHER full Region objects
+    (when adjacent region is within vision) OR bare string IDs (when out-of-vision).
+    Returns the full object, or None if out-of-vision.
+    """
+    if isinstance(entry, dict):
+        return entry  # Full object
+    if isinstance(entry, str):
+        # Look up in visibleRegions
+        for r in view.get("visibleRegions", []):
+            if isinstance(r, dict) and r.get("id") == entry:
+                return r
+    return None  # Out-of-vision — only ID is known
+
+
+def _get_region_id(entry) -> str:
+    """Extract region ID from either a string or dict entry."""
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        return entry.get("id", "")
+    return ""
 
 
 def reset_game_state():
-    global _known_agents, _map_knowledge, _hunting_target, _hunting_timer, _interacted_facilities
+    """Reset per-game tracking state. Call when game ends."""
+    global _known_agents, _map_knowledge
     _known_agents = {}
     _map_knowledge = {"revealed": False, "death_zones": set(), "safe_center": []}
-    _hunting_target = None
-    _hunting_timer = 0
-    _interacted_facilities = {}
-    log.info("=" * 60)
-    log.info("BERSERKER MODE v2.3 (FIX FACILITY LOOP)")
-    log.info("Prioritas: COMBAT > FACILITY > MOVEMENT")
-    log.info("=" * 60)
+    log.info("Strategy brain reset for new game")
+
+
+def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict | None:
+    """
+    Main decision engine. Returns action dict or None (wait).
+
+    Priority chain per game-loop.md §3 (v1.5.2):
+    1. DEATHZONE ESCAPE (overrides everything — 1.34 HP/sec!)
+    1b. Pre-escape pending death zone
+    2. [DISABLED] Curse resolution — curse temporarily disabled in v1.5.2
+    2b. Guardian threat evasion (guardians now attack players!)
+    3. Critical healing
+    3b. Use utility items (Map, Energy Drink)
+    4. Free actions (pickup, equip)
+    5. Guardian farming (120 sMoltz per kill — only 5 guardians!)
+    6. Favorable agent combat
+    7. Monster farming
+    8. Facility interaction
+    9. Strategic movement (NEVER into DZ or pending DZ)
+    10. Rest
+
+    Uses ALL api-summary.md view fields for decision making.
+    """
+    
+    global TURN_COUNTER, STRATEGY
+    TURN_COUNTER += 1
+    if USE_LLM and TURN_COUNTER % 5 == 0:
+        STRATEGY.update(ask_llm_strategy(view))
+    self_data = view.get("self", {})
+
+    region = view.get("currentRegion", {})
+    hp = self_data.get("hp", 100)
+    ep = self_data.get("ep", 10)
+    max_ep = self_data.get("maxEp", 10)
+    atk = self_data.get("atk", 10)
+    defense = self_data.get("def", 5)
+    is_alive = self_data.get("isAlive", True)
+    inventory = self_data.get("inventory", [])
+    equipped = self_data.get("equippedWeapon")
+
+    # View-level fields per api-summary.md
+    visible_agents = view.get("visibleAgents", [])
+    visible_monsters = view.get("visibleMonsters", [])
+    visible_npcs = view.get("visibleNPCs", [])
+    visible_items_raw = view.get("visibleItems", [])
+    # Unwrap: each visibleItem is { regionId, item: { id, name, typeId, ... } }
+    visible_items = []
+    for entry in visible_items_raw:
+        if not isinstance(entry, dict):
+            continue
+        inner = entry.get("item")
+        if isinstance(inner, dict):
+            inner["regionId"] = entry.get("regionId", "")
+            visible_items.append(inner)
+        elif entry.get("id"):
+            visible_items.append(entry)  # Legacy flat format
+    visible_regions = view.get("visibleRegions", [])
+    connected_regions = view.get("connectedRegions", [])
+    pending_dz = view.get("pendingDeathzones", [])
+    recent_logs = view.get("recentLogs", [])
+    messages = view.get("recentMessages", [])
+    alive_count = view.get("aliveCount", 100)
+
+    # Fallback connections from currentRegion if connectedRegions empty
+    connections = connected_regions or region.get("connections", [])
+    interactables = region.get("interactables", [])
+    region_id = region.get("id", "")
+    region_terrain = region.get("terrain", "").lower() if isinstance(region, dict) else ""
+    region_weather = region.get("weather", "").lower() if isinstance(region, dict) else ""
+
+    if not is_alive:
+        return None  # Dead — wait for game_ended
+
+    # ── Build FULL danger map (DZ + pending DZ) ───────────────────
+    # Used by ALL movement decisions to NEVER move into danger.
+    # v1.5.2: pendingDeathzones entries are {id, name} objects
+    danger_ids = set()
+    for dz in pending_dz:
+        if isinstance(dz, dict):
+            danger_ids.add(dz.get("id", ""))
+        elif isinstance(dz, str):
+            danger_ids.add(dz)  # Legacy fallback
+    # Also mark currently-active death zones from connected regions
+    for conn in connections:
+        resolved = _resolve_region(conn, view)
+        if resolved and resolved.get("isDeathZone"):
+            danger_ids.add(resolved.get("id", ""))
+
+    # Track visible agents for memory
+    _track_agents(visible_agents, self_data.get("id", ""), region_id)
+
+    # ── Priority 1: DEATHZONE ESCAPE (overrides everything) ───────
+    # Per game-systems.md: 1.34 HP/sec damage — bot dies fast!
+    move_ep_cost = _get_move_ep_cost(region_terrain, region_weather)
+    if region.get("isDeathZone", False):
+        safe = _find_safe_region(connections, danger_ids, view)
+        if safe and ep >= move_ep_cost:
+            log.warning("🚨 IN DEATH ZONE! Escaping to %s (HP=%d)", safe, hp)
+            return {"action": "move", "data": {"regionId": safe},
+                    "reason": f"ESCAPE: In death zone! HP={hp} dropping fast (1.34/sec)"}
+        elif not safe:
+            log.error("🚨 IN DEATH ZONE but NO SAFE REGION! All neighbors are DZ!")
+
+    # ── Priority 1b: Pre-escape pending death zone ────────────────
+    if region_id in danger_ids:
+        safe = _find_safe_region(connections, danger_ids, view)
+        if safe and ep >= move_ep_cost:
+            log.warning("⚠️ Region %s becoming DZ soon! Escaping to %s", region_id[:8], safe)
+            return {"action": "move", "data": {"regionId": safe},
+                    "reason": "PRE-ESCAPE: Region becoming death zone soon"}
+
+    # ── Priority 2: Curse resolution — DISABLED in v1.5.2 ─────────
+    # Curse is temporarily disabled. Guardians no longer curse players.
+    # Legacy code kept inert — will re-enable when curse returns.
+    # (was: _check_curse → whisper answer to guardian)
+
+    # ── Priority 2b: Guardian threat evasion (v1.5.2) ─────────────
+    # Guardians now ATTACK player agents directly! Flee if low HP.
+    guardians_here = [a for a in visible_agents
+                      if a.get("isGuardian", False) and a.get("isAlive", True)
+                      and a.get("regionId") == region_id]
+    if guardians_here and hp < 40 and ep >= move_ep_cost:
+        # Low HP + guardian in same region = flee!
+        safe = _find_safe_region(connections, danger_ids, view)
+        if safe:
+            log.warning("⚠️ Guardian threat! HP=%d, fleeing to safety", hp)
+            return {"action": "move", "data": {"regionId": safe},
+                    "reason": f"GUARDIAN FLEE: HP={hp}, guardian in region, too dangerous"}
+
+    # ── FREE ACTIONS (no cooldown, do before main action) ─────────
+
+    # Auto-pickup Moltz (currency) and valuable items
+    pickup_action = _check_pickup(visible_items, inventory, region_id)
+    if pickup_action:
+        return pickup_action
+
+    # Auto-equip better weapon
+    equip_action = _check_equip(inventory, equipped)
+    if equip_action:
+        return equip_action
+
+    # Use utility items: Map (reveal map), Megaphone (broadcast)
+    util_action = _use_utility_item(inventory, hp, ep, alive_count)
+    if util_action:
+        return util_action
+
+    # If cooldown active, only free actions allowed
+    if not can_act:
+        return None
+
+    # (Death zone escape already handled above as Priority 1)
+
+    # ── Priority 3: Healing management ─────────────────────────────
+    # HP < 30 = CRITICAL: use Bandage first (30 HP), then Medkit (50 HP)
+    # HP < 70 = MODERATE: use Emergency Food first (20 HP), save better items
+    if hp < 30:
+        heal = _find_healing_item(inventory, critical=True)
+        if heal:
+            return {"action": "use_item", "data": {"itemId": heal["id"]},
+                    "reason": f"CRITICAL HEAL: HP={hp}, using {heal.get('typeId', 'heal')}"}
+    elif hp < 70:
+        heal = _find_healing_item(inventory, critical=False)
+        if heal:
+            return {"action": "use_item", "data": {"itemId": heal["id"]},
+                    "reason": f"HEAL: HP={hp}, using {heal.get('typeId', 'heal')}"}
+
+    # ── Priority 4: EP recovery if cursed (EP=0) or very low ──────
+    if ep == 0:
+        # Check for energy drink first
+        energy_drink = _find_energy_drink(inventory)
+        if energy_drink:
+            return {"action": "use_item", "data": {"itemId": energy_drink["id"]},
+                    "reason": "EP RECOVERY: EP=0, using energy drink (+5 EP)"}
+
+    # ── Priority 5: Guardian farming (v1.5.2: 120 sMoltz per kill!) ─
+    # Only 5 guardians per free room — each worth 120 sMoltz!
+    # Guardians now ATTACK back — only fight if we can win.
+    guardians = [a for a in visible_agents
+                 if a.get("isGuardian", False) and a.get("isAlive", True)]
+    if guardians and ep >= 2 and hp >= 35:
+        target = _select_weakest(guardians)
+        w_range = get_weapon_range(equipped)
+        if _is_in_range(target, region_id, w_range, connections):
+            # v1.5.2: guardians fight back — check if we can take them
+            my_dmg = calc_damage(atk, get_weapon_bonus(equipped),
+                                target.get("def", 5), region_weather)
+            guardian_dmg = calc_damage(target.get("atk", 10),
+                                       _estimate_enemy_weapon_bonus(target),
+                                       defense, region_weather)
+            # Fight if we deal more damage OR target is low HP (finish off)
+            if my_dmg >= guardian_dmg or target.get("hp", 100) <= my_dmg * 3:
+                return {"action": "attack",
+                        "data": {"targetId": target["id"], "targetType": "agent"},
+                        "reason": f"GUARDIAN FARM: HP={target.get('hp','?')} "
+                                  f"(120 sMoltz! dmg={my_dmg} vs {guardian_dmg})"}
+
+    # ── Priority 6: Favorable agent combat ────────────────────────
+    # Be more aggressive when fewer agents remain (late game)
+    # Per game-systems.md: avoid combat in storm(-15%) or fog(-10%)
+    hp_threshold = 40 if alive_count > 20 else 25
+    enemies = [a for a in visible_agents
+               if not a.get("isGuardian", False) and a.get("isAlive", True)
+               and a.get("id") != self_data.get("id")]
+    if enemies and ep >= 2 and hp >= hp_threshold:
+        target = _select_weakest(enemies)
+        w_range = get_weapon_range(equipped)
+        if _is_in_range(target, region_id, w_range, connections):
+            my_dmg = calc_damage(atk, get_weapon_bonus(equipped),
+                                target.get("def", 5), region_weather)
+            enemy_dmg = calc_damage(target.get("atk", 10),
+                                     _estimate_enemy_weapon_bonus(target),
+                                     defense, region_weather)
+            # Fight only if we deal more damage or target is low HP
+            if my_dmg > enemy_dmg or target.get("hp", 100) <= my_dmg * 2:
+                return {"action": "attack",
+                        "data": {"targetId": target["id"], "targetType": "agent"},
+                        "reason": f"COMBAT: Target HP={target.get('hp', '?')}, "
+                                  f"dmg={my_dmg} vs enemy_dmg={enemy_dmg}"}
+
+    # ── Priority 7: Monster farming ───────────────────────────────
+    monsters = [m for m in visible_monsters if m.get("hp", 0) > 0]
+    if monsters and ep >= 2:
+        target = _select_weakest(monsters)
+        w_range = get_weapon_range(equipped)
+        if _is_in_range(target, region_id, w_range, connections):
+            return {"action": "attack",
+                    "data": {"targetId": target["id"], "targetType": "monster"},
+                    "reason": f"MONSTER FARM: {target.get('name', 'monster')} HP={target.get('hp', '?')}"}
+
+    # ── Priority 7b: Moderate healing (HP < 70, safe area) ────────
+    if hp < 70 and not enemies:
+        heal = _find_healing_item(inventory, critical=(hp < 30))
+        if heal:
+            return {"action": "use_item", "data": {"itemId": heal["id"]},
+                    "reason": f"HEAL: HP={hp}, area safe, using {heal.get('typeId', 'heal')}"}
+
+    # ── Priority 8: Facility interaction ──────────────────────────
+    if interactables and ep >= 2 and not region.get("isDeathZone"):
+        facility = _select_facility(interactables, hp, ep)
+        if facility:
+            return {"action": "interact",
+                    "data": {"interactableId": facility["id"]},
+                    "reason": f"FACILITY: {facility.get('type', 'unknown')}"}
+
+    # ── Priority 9: Strategic movement ────────────────────────────
+    # Use connectedRegions — NEVER move into DZ or pending DZ!
+    if ep >= move_ep_cost and connections:
+        move_target = _choose_move_target(connections, danger_ids,
+                                           region, visible_items, alive_count)
+        if move_target:
+            return {"action": "move", "data": {"regionId": move_target},
+                    "reason": "EXPLORE: Moving to better position"}
+
+    # ── Priority 10: Rest (EP < 4 and safe) ───────────────────────
+    if ep < 4 and not enemies and not region.get("isDeathZone") and region_id not in danger_ids:
+        return {"action": "rest", "data": {},
+                "reason": f"REST: EP={ep}/{max_ep}, area is safe (+1 bonus EP)"}
+
+    
+    # =========================
+    # 🧠 UTILITY AI (FINAL LAYER)
+    # =========================
+    try:
+        mode = STRATEGY.get("mode", "balanced")
+        risk = STRATEGY.get("risk", 0.5)
+
+        candidates = []
+
+        # Heal scoring
+        heal_item = _find_healing_item(inventory, critical=(hp < 30))
+        if heal_item:
+            score = (100 - hp) * 1.5
+            if mode == "defensive":
+                score *= 1.4
+            candidates.append((score, {"action": "use_item", "data": {"itemId": heal_item["id"]}, "reason": "UTILITY_HEAL"}))
+
+        # Attack scoring
+        enemies_util = [a for a in visible_agents if a.get("isAlive") and not a.get("isGuardian")]
+        if enemies_util:
+            target = _select_weakest(enemies_util)
+            my_dmg = calc_damage(atk, get_weapon_bonus(equipped), target.get("def", 5), region_weather)
+            enemy_dmg = calc_damage(target.get("atk", 10), _estimate_enemy_weapon_bonus(target), defense, region_weather)
+            score = (my_dmg - enemy_dmg) * 2
+            if mode == "aggressive":
+                score *= (1.2 + risk)
+            if score > 0:
+                candidates.append((score, {"action": "attack", "data": {"targetId": target["id"], "targetType": "agent"}, "reason": "UTILITY_ATTACK"}))
+
+        # Move scoring
+        if ep >= move_ep_cost:
+            for conn in connections:
+                rid = conn if isinstance(conn, str) else conn.get("id", "")
+                if rid:
+                    score = 10
+                    candidates.append((score, {"action": "move", "data": {"regionId": rid}, "reason": "UTILITY_MOVE"}))
+
+        if candidates:
+            best = max(candidates, key=lambda x: x[0])[1]
+            return best
+    except Exception as e:
+        log.debug("Utility fallback error: %s", e)
+
+    return None  # Wait for next turn
+
+
+# ── Helper functions ──────────────────────────────────────────────────
+
+def _get_move_ep_cost(terrain: str, weather: str) -> int:
+    """Calculate move EP cost per game-systems.md.
+    Base: 2. Storm: +1. Water terrain: 3.
+    """
+    if terrain == "water":
+        return 3
+    if weather == "storm":
+        return 3  # 2 base + 1 storm
+    return 2
+
+
+def _estimate_enemy_weapon_bonus(agent: dict) -> int:
+    """Estimate enemy's weapon bonus from their equipped weapon."""
+    weapon = agent.get("equippedWeapon")
+    if not weapon:
+        return 0
+    type_id = weapon.get("typeId", "").lower() if isinstance(weapon, dict) else ""
+    return WEAPONS.get(type_id, {}).get("bonus", 0)
+
+
+# Track observed agents for memory (threat assessment)
+_known_agents: dict = {}
+
+
+# ── CURSE HANDLING — DISABLED in v1.5.2 ───────────────────────────────
+# Curse is temporarily disabled per strategy.md v1.5.2.
+# Guardians no longer set victim EP to 0 and no whisper-question/answer flow.
+# Legacy code kept below for reference — will re-enable when curse returns.
+#
+# def _check_curse(messages, my_id) -> dict | None:
+#     """DISABLED: Guardian curse is temporarily disabled in v1.5.2."""
+#     return None
+#
+# def _solve_curse_question(question) -> str:
+#     """DISABLED: Guardian curse is temporarily disabled in v1.5.2."""
+#     return ""
+
+
+def _check_pickup(items: list, inventory: list, region_id: str) -> dict | None:
+    """Smart pickup: weapons > healing stockpile > utility > Moltz (always).
+    Max inventory = 10 per limits.md.
+    Strategy:
+    - Moltz ($rewards): ALWAYS pickup, highest priority
+    - Weapons: pickup if better than current OR no weapon equipped
+    - Healing: stockpile for endgame (keep at least 2-3 healing items)
+    - Binoculars: passive vision+1, always pickup
+    - Map: pickup and use immediately
+    """
+    if len(inventory) >= 10:
+        return None
+    # Filter items in current region (items may lack regionId field)
+    local_items = [i for i in items
+                   if isinstance(i, dict) and i.get("regionId") == region_id]
+    # Fallback: if regionId filter found nothing, use all visible items
+    # (the game may not set regionId on item objects)
+    if not local_items:
+        local_items = [i for i in items if isinstance(i, dict) and i.get("id")]
+    if not local_items:
+        return None
+
+    # Count current healing items for stockpile management
+    heal_count = sum(1 for i in inventory if isinstance(i, dict)
+                     and i.get("typeId", "").lower() in RECOVERY_ITEMS
+                     and RECOVERY_ITEMS.get(i.get("typeId", "").lower(), 0) > 0)
+
+    # Sort by priority — Moltz always first
+    local_items.sort(
+        key=lambda i: _pickup_score(i, inventory, heal_count), reverse=True)
+    best = local_items[0]
+    score = _pickup_score(best, inventory, heal_count)
+    if score > 0:
+        type_id = best.get('typeId', 'item')
+        log.info("PICKUP: %s (score=%d, heal_stock=%d)", type_id, score, heal_count)
+        return {"action": "pickup", "data": {"itemId": best["id"]},
+                "reason": f"PICKUP: {type_id}"}
+    return None
+
+
+def _pickup_score(item: dict, inventory: list, heal_count: int) -> int:
+    """Calculate dynamic pickup score based on current inventory state."""
+    type_id = item.get("typeId", "").lower()
+    category = item.get("category", "").lower()
+
+    # Moltz/sMoltz — ALWAYS pickup
+    if type_id == "rewards" or category == "currency":
+        return 300
+
+    # Weapons: higher score if no weapon or this is better
+    if category == "weapon":
+        bonus = WEAPONS.get(type_id, {}).get("bonus", 0)
+        # Check current best weapon in inventory
+        current_best = 0
+        for inv_item in inventory:
+            if isinstance(inv_item, dict) and inv_item.get("category") == "weapon":
+                cb = WEAPONS.get(inv_item.get("typeId", "").lower(), {}).get("bonus", 0)
+                current_best = max(current_best, cb)
+        if bonus > current_best:
+            return 100 + bonus  # Better weapon = very high priority
+        return 0  # Already have equal or better
+
+    # Binoculars: passive vision+1 permanent, always pickup
+    if type_id == "binoculars":
+        has_binos = any(isinstance(i, dict) and i.get("typeId", "").lower() == "binoculars"
+                       for i in inventory)
+        return 55 if not has_binos else 0  # Don't stack
+
+    # Map: always pickup (will be used immediately)
+    if type_id == "map":
+        return 52
+
+    # Healing items: stockpile for endgame (want 3-4 items)
+    if type_id in RECOVERY_ITEMS and RECOVERY_ITEMS.get(type_id, 0) > 0:
+        if heal_count < 4:  # Need more healing for endgame
+            return ITEM_PRIORITY.get(type_id, 0) + 10
+        return ITEM_PRIORITY.get(type_id, 0)  # Normal priority
+
+    # Energy drink
+    if type_id == "energy_drink":
+        return 58
+
+    return ITEM_PRIORITY.get(type_id, 0)
+
+
+def _check_equip(inventory: list, equipped) -> dict | None:
+    """Auto-equip best weapon from inventory."""
+    current_bonus = get_weapon_bonus(equipped) if equipped else 0
+    best = None
+    best_bonus = current_bonus
+    for item in inventory:
+        if not isinstance(item, dict):
+            continue
+        if item.get("category") == "weapon":
+            type_id = item.get("typeId", "").lower()
+            bonus = WEAPONS.get(type_id, {}).get("bonus", 0)
+            if bonus > best_bonus:
+                best = item
+                best_bonus = bonus
+    if best:
+        return {"action": "equip", "data": {"itemId": best["id"]},
+                "reason": f"EQUIP: {best.get('typeId', 'weapon')} (+{best_bonus} ATK)"}
+    return None
+
+
+def _find_safe_region(connections, danger_ids: set, view: dict = None) -> str | None:
+    """Find nearest connected region that's NOT a death zone AND NOT pending DZ.
+    Per v1.5.2 gotchas.md §3: connectedRegions entries are EITHER full Region objects
+    (when visible) OR bare string IDs (when out-of-vision). Use _resolve_region().
+    danger_ids = set of all DZ + pending DZ region IDs.
+    """
+    safe_regions = []
+    for conn in connections:
+        if isinstance(conn, str):
+            if conn not in danger_ids:
+                safe_regions.append((conn, 0))
+        elif isinstance(conn, dict):
+            rid = conn.get("id", "")
+            is_dz = conn.get("isDeathZone", False)
+            if rid and not is_dz and rid not in danger_ids:
+                terrain = conn.get("terrain", "").lower()
+                score = {"hills": 3, "plains": 2, "ruins": 1, "forest": 0, "water": -2}.get(terrain, 0)
+                safe_regions.append((rid, score))
+
+    if safe_regions:
+        safe_regions.sort(key=lambda x: x[1], reverse=True)
+        chosen = safe_regions[0][0]
+        log.debug("Safe region selected: %s (score=%d, %d candidates)",
+                  chosen[:8], safe_regions[0][1], len(safe_regions))
+        return chosen
+
+    # Last resort: any non-DZ connection (even if pending)
+    for conn in connections:
+        rid = conn if isinstance(conn, str) else conn.get("id", "")
+        is_dz = conn.get("isDeathZone", False) if isinstance(conn, dict) else False
+        if rid and not is_dz:
+            log.warning("No fully safe region! Using fallback: %s", rid[:8])
+            return rid
+    return None
+
+
+def _find_healing_item(inventory: list, critical: bool = False) -> dict | None:
+    """Find best healing item based on urgency.
+    critical=True (HP<30): prefer Bandage(30) then Medkit(50) — big heals first
+    critical=False (HP<70): prefer Emergency Food(20) — save big heals for later
+    """
+    heals = []
+    for i in inventory:
+        if not isinstance(i, dict):
+            continue
+        type_id = i.get("typeId", "").lower()
+        if type_id in RECOVERY_ITEMS and RECOVERY_ITEMS[type_id] > 0:
+            heals.append(i)
+    if not heals:
+        return None
+
+    if critical:
+        # Critical: use biggest heal first (Medkit > Bandage > Emergency Food)
+        heals.sort(key=lambda i: RECOVERY_ITEMS.get(i.get("typeId", "").lower(), 0), reverse=True)
+    else:
+        # Normal: use smallest heal first (Emergency Food first, save big heals)
+        heals.sort(key=lambda i: RECOVERY_ITEMS.get(i.get("typeId", "").lower(), 0))
+    return heals[0]
+
+
+def _find_energy_drink(inventory: list) -> dict | None:
+    """Find energy drink for EP recovery (+5 EP per combat-items.md)."""
+    for i in inventory:
+        if isinstance(i, dict) and i.get("typeId", "").lower() == "energy_drink":
+            return i
+    return None
+
+
+def _select_weakest(targets: list) -> dict:
+    """Select target with lowest HP."""
+    return min(targets, key=lambda t: t.get("hp", 999))
+
+
+def _is_in_range(target: dict, my_region: str, weapon_range: int,
+                  connections=None) -> bool:
+    """Check if target is in weapon range.
+    Per combat-items.md: melee = same region, ranged = 1-2 regions.
+    """
+    target_region = target.get("regionId", "")
+
+    # No regionId on target — assume same region (visible agents in same region)
+    if not target_region:
+        return True
+
+    if target_region == my_region:
+        return True  # Same region — melee and ranged both work
+
+    if weapon_range >= 1 and connections:
+        # Check if target is in an adjacent region (range 1+)
+        adj_ids = set()
+        for conn in connections:
+            if isinstance(conn, str):
+                adj_ids.add(conn)
+            elif isinstance(conn, dict):
+                adj_ids.add(conn.get("id", ""))
+        if target_region in adj_ids:
+            return True
+
+    # Target is out of weapon range
+    return False
+
+
+def _select_facility(interactables: list, hp: int, ep: int) -> dict | None:
+    """Select best facility to interact with per game-systems.md.
+    Facilities: supply_cache, medical_facility, watchtower, broadcast_station, cave.
+    """
+    for fac in interactables:
+        if not isinstance(fac, dict):
+            continue
+        if fac.get("isUsed"):
+            continue
+        ftype = fac.get("type", "").lower()
+        # Priority: medical (if HP < 80) > supply_cache > watchtower > broadcast_station
+        if ftype == "medical_facility" and hp < 80:
+            return fac
+        if ftype == "supply_cache":
+            return fac
+        if ftype == "watchtower":
+            return fac
+        if ftype == "broadcast_station":
+            return fac
+    return None
+
+
+def _track_agents(visible_agents: list, my_id: str, my_region: str):
+    """Track observed agents for threat assessment (agent-memory.md temp.knownAgents)."""
+    global _known_agents
+    for agent in visible_agents:
+        if not isinstance(agent, dict):
+            continue
+        aid = agent.get("id", "")
+        if not aid or aid == my_id:
+            continue
+        _known_agents[aid] = {
+            "hp": agent.get("hp", 100),
+            "atk": agent.get("atk", 10),
+            "isGuardian": agent.get("isGuardian", False),
+            "equippedWeapon": agent.get("equippedWeapon"),
+            "lastSeen": my_region,
+            "isAlive": agent.get("isAlive", True),
+        }
+    # Limit size
+    if len(_known_agents) > 50:
+        # Remove dead agents first
+        dead = [k for k, v in _known_agents.items() if not v.get("isAlive", True)]
+        for d in dead:
+            del _known_agents[d]
+
+
+def _use_utility_item(inventory: list, hp: int, ep: int, alive_count: int) -> dict | None:
+    """Use utility items immediately after pickup.
+    Map: reveals entire map → triggers _learn_from_map next view.
+    Binoculars: PASSIVE (vision+1 just by holding) — no use_item needed.
+    """
+    for item in inventory:
+        if not isinstance(item, dict):
+            continue
+        type_id = item.get("typeId", "").lower()
+        # Map: use immediately to reveal entire map
+        if type_id == "map":
+            log.info("🗺️ Using Map! Will reveal entire map for strategic learning.")
+            return {"action": "use_item", "data": {"itemId": item["id"]},
+                    "reason": "UTILITY: Using Map — reveals entire map for DZ tracking"}
+    return None
 
 
 def learn_from_map(view: dict):
+    """Called after Map is used — learn entire map layout.
+    Track all death zones, pending DZ, and find safe center regions.
+    Per game-guide.md: Map reveals entire map (1-time consumable).
+    """
     global _map_knowledge
     visible_regions = view.get("visibleRegions", [])
     if not visible_regions:
@@ -116,313 +793,32 @@ def learn_from_map(view: dict):
         if region.get("isDeathZone"):
             _map_knowledge["death_zones"].add(rid)
         else:
+            # Count connections — center regions have more connections
             conns = region.get("connections", [])
             terrain = region.get("terrain", "").lower()
             terrain_value = {"hills": 3, "plains": 2, "ruins": 2, "forest": 1, "water": -1}.get(terrain, 0)
             score = len(conns) + terrain_value
             safe_regions.append((rid, score))
 
+    # Sort by connectivity+terrain — highest = most likely center
     safe_regions.sort(key=lambda x: x[1], reverse=True)
     _map_knowledge["safe_center"] = [r[0] for r in safe_regions[:5]]
 
-    log.info("MAP LEARNED: %d DZ regions", len(_map_knowledge["death_zones"]))
-
-
-def calc_damage(atk: int, weapon_bonus: int, target_def: int,
-                weather: str = "clear") -> int:
-    base = atk + weapon_bonus - int(target_def * 0.5)
-    penalty = WEATHER_COMBAT_PENALTY.get(weather, 0.0)
-    return max(1, int(base * (1 - penalty)))
-
-
-def get_weapon_bonus(equipped_weapon) -> int:
-    if not equipped_weapon:
-        return 0
-    type_id = equipped_weapon.get("typeId", "").lower()
-    return WEAPONS.get(type_id, {}).get("bonus", 0)
-
-
-def get_weapon_range(equipped_weapon) -> int:
-    if not equipped_weapon:
-        return 0
-    type_id = equipped_weapon.get("typeId", "").lower()
-    return WEAPONS.get(type_id, {}).get("range", 0)
-
-
-def _resolve_region(entry, view: dict):
-    if isinstance(entry, dict):
-        return entry
-    if isinstance(entry, str):
-        for r in view.get("visibleRegions", []):
-            if isinstance(r, dict) and r.get("id") == entry:
-                return r
-    return None
-
-
-def _get_region_id(entry) -> str:
-    if isinstance(entry, str):
-        return entry
-    if isinstance(entry, dict):
-        return entry.get("id", "")
-    return ""
-
-
-def _get_move_ep_cost(terrain: str, weather: str) -> int:
-    if terrain == "water":
-        return 3
-    if weather == "storm":
-        return 3
-    return 2
-
-
-def _estimate_enemy_weapon_bonus(agent: dict) -> int:
-    weapon = agent.get("equippedWeapon")
-    if not weapon:
-        return 0
-    type_id = weapon.get("typeId", "").lower() if isinstance(weapon, dict) else ""
-    return WEAPONS.get(type_id, {}).get("bonus", 0)
-
-
-def _select_weakest(targets: list) -> dict:
-    return min(targets, key=lambda t: t.get("hp", 999))
-
-
-def _is_in_range(target: dict, my_region: str, weapon_range: int, connections=None) -> bool:
-    target_region = target.get("regionId", "")
-    if not target_region:
-        return True
-    if target_region == my_region:
-        return True
-    if weapon_range >= 1 and connections:
-        adj_ids = set()
-        for conn in connections:
-            if isinstance(conn, str):
-                adj_ids.add(conn)
-            elif isinstance(conn, dict):
-                adj_ids.add(conn.get("id", ""))
-        if target_region in adj_ids:
-            return True
-    return False
-
-
-def _find_safe_region(connections, danger_ids: set, view: dict = None) -> str | None:
-    safe_regions = []
-    for conn in connections:
-        if isinstance(conn, str):
-            if conn not in danger_ids:
-                safe_regions.append((conn, 0))
-        elif isinstance(conn, dict):
-            rid = conn.get("id", "")
-            is_dz = conn.get("isDeathZone", False)
-            if rid and not is_dz and rid not in danger_ids:
-                terrain = conn.get("terrain", "").lower()
-                score = {"hills": 3, "plains": 2, "ruins": 1, "forest": 0, "water": -2}.get(terrain, 0)
-                safe_regions.append((rid, score))
-
-    if safe_regions:
-        safe_regions.sort(key=lambda x: x[1], reverse=True)
-        return safe_regions[0][0]
-
-    for conn in connections:
-        rid = conn if isinstance(conn, str) else conn.get("id", "")
-        is_dz = conn.get("isDeathZone", False) if isinstance(conn, dict) else False
-        if rid and not is_dz:
-            return rid
-    return None
-
-
-def _find_healing_item(inventory: list, critical: bool = False) -> dict | None:
-    heals = []
-    for i in inventory:
-        if not isinstance(i, dict):
-            continue
-        type_id = i.get("typeId", "").lower()
-        if type_id in RECOVERY_ITEMS and RECOVERY_ITEMS[type_id] > 0:
-            heals.append(i)
-    if not heals:
-        return None
-
-    if critical:
-        heals.sort(key=lambda i: RECOVERY_ITEMS.get(i.get("typeId", "").lower(), 0), reverse=True)
-    else:
-        heals.sort(key=lambda i: RECOVERY_ITEMS.get(i.get("typeId", "").lower(), 0))
-    return heals[0]
-
-
-def _find_energy_drink(inventory: list) -> dict | None:
-    for i in inventory:
-        if isinstance(i, dict) and i.get("typeId", "").lower() == "energy_drink":
-            return i
-    return None
-
-
-def _check_pickup(items: list, inventory: list, region_id: str) -> dict | None:
-    if len(inventory) >= 10:
-        return None
-    
-    local_items = [i for i in items
-                   if isinstance(i, dict) and i.get("regionId") == region_id]
-    if not local_items:
-        local_items = [i for i in items if isinstance(i, dict) and i.get("id")]
-    if not local_items:
-        return None
-
-    heal_count = sum(1 for i in inventory if isinstance(i, dict)
-                     and i.get("typeId", "").lower() in RECOVERY_ITEMS
-                     and RECOVERY_ITEMS.get(i.get("typeId", "").lower(), 0) > 0)
-
-    local_items.sort(
-        key=lambda i: _pickup_score(i, inventory, heal_count), reverse=True)
-    best = local_items[0]
-    score = _pickup_score(best, inventory, heal_count)
-    if score > 0:
-        type_id = best.get('typeId', 'item')
-        log.info("PICKUP: %s (score=%d)", type_id, score)
-        return {"action": "pickup", "data": {"itemId": best["id"]},
-                "reason": f"PICKUP: {type_id}"}
-    return None
-
-
-def _pickup_score(item: dict, inventory: list, heal_count: int) -> int:
-    type_id = item.get("typeId", "").lower()
-    category = item.get("category", "").lower()
-
-    if type_id == "rewards" or category == "currency":
-        return 300
-
-    if category == "weapon":
-        bonus = WEAPONS.get(type_id, {}).get("bonus", 0)
-        current_best = 0
-        for inv_item in inventory:
-            if isinstance(inv_item, dict) and inv_item.get("category") == "weapon":
-                cb = WEAPONS.get(inv_item.get("typeId", "").lower(), {}).get("bonus", 0)
-                current_best = max(current_best, cb)
-        if bonus > current_best:
-            return 100 + bonus
-        return 0
-
-    if type_id == "binoculars":
-        has_binos = any(isinstance(i, dict) and i.get("typeId", "").lower() == "binoculars"
-                       for i in inventory)
-        return 55 if not has_binos else 0
-
-    if type_id == "map":
-        return 52
-
-    if type_id in RECOVERY_ITEMS and RECOVERY_ITEMS.get(type_id, 0) > 0:
-        if heal_count < 4:
-            return ITEM_PRIORITY.get(type_id, 0) + 10
-        return ITEM_PRIORITY.get(type_id, 0)
-
-    if type_id == "energy_drink":
-        return 58
-
-    return ITEM_PRIORITY.get(type_id, 0)
-
-
-def _check_equip(inventory: list, equipped) -> dict | None:
-    current_bonus = get_weapon_bonus(equipped) if equipped else 0
-    best = None
-    best_bonus = current_bonus
-    for item in inventory:
-        if not isinstance(item, dict):
-            continue
-        if item.get("category") == "weapon":
-            type_id = item.get("typeId", "").lower()
-            bonus = WEAPONS.get(type_id, {}).get("bonus", 0)
-            if bonus > best_bonus:
-                best = item
-                best_bonus = bonus
-    if best:
-        log.info("EQUIP: %s (+%d ATK)", best.get('typeId', 'weapon'), best_bonus)
-        return {"action": "equip", "data": {"itemId": best["id"]},
-                "reason": f"EQUIP: {best.get('typeId', 'weapon')}"}
-    return None
-
-
-def _use_utility_item(inventory: list, hp: int, ep: int, alive_count: int) -> dict | None:
-    for item in inventory:
-        if not isinstance(item, dict):
-            continue
-        type_id = item.get("typeId", "").lower()
-        if type_id == "map":
-            log.info("Using Map!")
-            return {"action": "use_item", "data": {"itemId": item["id"]},
-                    "reason": "UTILITY: Using Map"}
-    return None
-
-
-def _select_facility_with_limit(interactables: list, hp: int, ep: int, current_turn: int) -> dict | None:
-    """
-    Pilih facility dengan batasan:
-    - Tidak akan interact facility yang sudah di-interact sebelumnya (atau cooldown)
-    - Prioritaskan medical_facility (jika HP rendah)
-    """
-    global _interacted_facilities
-    
-    if not interactables:
-        return None
-    
-    # Bersihkan facility lama (lebih dari cooldown)
-    cooldown = BERSERKER_CONFIG["FACILITY_COOLDOWN_TURNS"]
-    expired = [fid for fid, turn in _interacted_facilities.items() if current_turn - turn > cooldown]
-    for fid in expired:
-        del _interacted_facilities[fid]
-    
-    for fac in interactables:
-        if not isinstance(fac, dict):
-            continue
-        if fac.get("isUsed"):
-            continue
-        
-        fid = fac.get("id", "")
-        
-        # Cek apakah facility sudah pernah di-interact baru-baru ini
-        if fid in _interacted_facilities:
-            log.debug("Facility %s on cooldown (interacted at turn %d)", 
-                     fac.get("type", "unknown"), _interacted_facilities[fid])
-            continue
-        
-        ftype = fac.get("type", "").lower()
-        
-        # Medical facility: hanya jika HP rendah
-        if ftype == "medical_facility" and hp < 70:
-            return fac
-        
-        # Facility lain: hanya jika tidak ada musuh
-        if ftype in ["supply_cache", "watchtower", "broadcast_station"]:
-            # Batasi maksimal interact per facility
-            return fac
-    
-    return None
-
-
-def _track_agents(visible_agents: list, my_id: str, my_region: str):
-    global _known_agents
-    for agent in visible_agents:
-        if not isinstance(agent, dict):
-            continue
-        aid = agent.get("id", "")
-        if not aid or aid == my_id:
-            continue
-        _known_agents[aid] = {
-            "hp": agent.get("hp", 100),
-            "atk": agent.get("atk", 10),
-            "isGuardian": agent.get("isGuardian", False),
-            "equippedWeapon": agent.get("equippedWeapon"),
-            "lastSeen": my_region,
-            "isAlive": agent.get("isAlive", True),
-        }
-    if len(_known_agents) > 50:
-        dead = [k for k, v in _known_agents.items() if not v.get("isAlive", True)]
-        for d in dead:
-            del _known_agents[d]
+    log.info("🗺️ MAP LEARNED: %d DZ regions, %d safe regions, top center: %s",
+             len(_map_knowledge["death_zones"]),
+             len(safe_regions),
+             _map_knowledge["safe_center"][:3])
 
 
 def _choose_move_target(connections, danger_ids: set,
                          current_region: dict, visible_items: list,
                          alive_count: int) -> str | None:
+    """Choose best region to move to.
+    CRITICAL: NEVER move into a death zone or pending death zone!
+    """
     candidates = []
+
+    # Build set of regions with visible items for attraction
     item_regions = set()
     for item in visible_items:
         if isinstance(item, dict):
@@ -430,6 +826,7 @@ def _choose_move_target(connections, danger_ids: set,
 
     for conn in connections:
         if isinstance(conn, str):
+            # HARD BLOCK: never move into danger zone
             if conn in danger_ids:
                 continue
             score = 1
@@ -439,34 +836,45 @@ def _choose_move_target(connections, danger_ids: set,
 
         elif isinstance(conn, dict):
             rid = conn.get("id", "")
+            # HARD BLOCK: never move into DZ or pending DZ
             if not rid or conn.get("isDeathZone") or rid in danger_ids:
                 continue
 
             score = 0
             terrain = conn.get("terrain", "").lower()
-            terrain_scores = {"hills": 4, "plains": 2, "ruins": 2, "forest": 1, "water": -3}
+
+            # Terrain scoring per game-systems.md
+            terrain_scores = {
+                "hills": 4, "plains": 2, "ruins": 2,
+                "forest": 1, "water": -3,
+            }
             score += terrain_scores.get(terrain, 0)
 
             if rid in item_regions:
                 score += 5
 
+            # Facilities attract
             facs = conn.get("interactables", [])
             if facs:
                 unused = [f for f in facs if isinstance(f, dict) and not f.get("isUsed")]
                 score += len(unused) * 2
 
+            # Avoid weather penalties
             weather = conn.get("weather", "").lower()
             weather_penalty = {"storm": -2, "fog": -1, "rain": 0, "clear": 1}
             score += weather_penalty.get(weather, 0)
 
+            # Late game: strong bonus for safe regions
             if alive_count < 30:
                 score += 3
 
+            # MAP KNOWLEDGE: prefer center regions learned from Map
             if _map_knowledge.get("revealed") and rid in _map_knowledge.get("safe_center", []):
-                score += 5
+                score += 5  # Strong pull toward center
 
+            # MAP KNOWLEDGE: avoid known death zones
             if rid in _map_knowledge.get("death_zones", set()):
-                continue
+                continue  # HARD BLOCK
 
             candidates.append((rid, score))
 
@@ -475,347 +883,18 @@ def _choose_move_target(connections, danger_ids: set,
 
     candidates.sort(key=lambda x: x[1], reverse=True)
     return candidates[0][0]
-
-
-def select_target_with_priority(enemies: list, current_target: dict = None) -> dict | None:
-    if not enemies:
-        return None
-    
-    global _hunting_target, _hunting_timer
-    
-    # PRIORITY 1: Hunting target
-    if BERSERKER_CONFIG["HUNTING_MODE"] and _hunting_target:
-        target_alive = False
-        for enemy in enemies:
-            if enemy.get("id") == _hunting_target.get("id"):
-                target_alive = True
-                _hunting_target = enemy
-                break
-        
-        if target_alive:
-            log.info("HUNTING TARGET: Melanjutkan berburu!")
-            return _hunting_target
-        else:
-            log.info("HUNTING COMPLETE: Target sudah mati!")
-            _hunting_target = None
-    
-    # PRIORITY 2: Execute (HP < 30)
-    execute_targets = [e for e in enemies if e.get("hp", 100) < BERSERKER_CONFIG["EXECUTE_PRIORITY"]]
-    if execute_targets:
-        target = min(execute_targets, key=lambda e: e.get("hp", 999))
-        log.info("EXECUTE PRIORITY: Musuh HP=%d!", target.get("hp", 0))
-        return target
-    
-    # PRIORITY 3: Wounded (HP < 50)
-    wounded_targets = [e for e in enemies if e.get("hp", 100) < BERSERKER_CONFIG["WOUNDED_HP_THRESHOLD"]]
-    if wounded_targets:
-        target = min(wounded_targets, key=lambda e: e.get("hp", 999))
-        log.info("WOUNDED PRIORITY: Musuh HP=%d, terus kejar!", target.get("hp", 0))
-        return target
-    
-    # PRIORITY 4: Weakest
-    return _select_weakest(enemies)
-
-
-def update_hunting_target(target: dict):
-    global _hunting_target, _hunting_timer
-    if target and BERSERKER_CONFIG["HUNTING_MODE"]:
-        _hunting_target = target
-        _hunting_timer = BERSERKER_CONFIG["TARGET_MARK_DURATION"]
-        log.info("NEW HUNTING TARGET: ID=%s, HP=%d", target.get("id", "unknown")[:8], target.get("hp", 0))
-
-
-# =========================
-# 🧠 MAIN DECISION
-# =========================
-
-def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict | None:
-    global _hunting_target, _hunting_timer, _interacted_facilities
-    import time
-    
-    self_data = view.get("self", {})
-    region = view.get("currentRegion", {})
-    hp = self_data.get("hp", 100)
-    ep = self_data.get("ep", 10)
-    max_ep = self_data.get("maxEp", 10)
-    atk = self_data.get("atk", 10)
-    defense = self_data.get("def", 5)
-    is_alive = self_data.get("isAlive", True)
-    inventory = self_data.get("inventory", [])
-    equipped = self_data.get("equippedWeapon")
-
-    visible_agents = view.get("visibleAgents", [])
-    visible_monsters = view.get("visibleMonsters", [])
-    visible_items_raw = view.get("visibleItems", [])
-    
-    visible_items = []
-    for entry in visible_items_raw:
-        if not isinstance(entry, dict):
-            continue
-        inner = entry.get("item")
-        if isinstance(inner, dict):
-            inner["regionId"] = entry.get("regionId", "")
-            visible_items.append(inner)
-        elif entry.get("id"):
-            visible_items.append(entry)
-    
-    connected_regions = view.get("connectedRegions", [])
-    pending_dz = view.get("pendingDeathzones", [])
-    alive_count = view.get("aliveCount", 100)
-    
-    connections = connected_regions or region.get("connections", [])
-    interactables = region.get("interactables", [])
-    region_id = region.get("id", "")
-    region_terrain = region.get("terrain", "").lower() if isinstance(region, dict) else ""
-    region_weather = region.get("weather", "").lower() if isinstance(region, dict) else ""
-
-    if not is_alive:
-        return None
-
-    # Current turn (gunakan turn counter atau timestamp)
-    current_turn = view.get("turn", 0) or int(time.time())
-
-    # Decrement hunting timer
-    if _hunting_timer > 0:
-        _hunting_timer -= 1
-    elif _hunting_target:
-        _hunting_target = None
-
-    # Danger map
-    danger_ids = set()
-    for dz in pending_dz:
-        if isinstance(dz, dict):
-            danger_ids.add(dz.get("id", ""))
-        elif isinstance(dz, str):
-            danger_ids.add(dz)
-    for conn in connections:
-        resolved = _resolve_region(conn, view)
-        if resolved and resolved.get("isDeathZone"):
-            danger_ids.add(resolved.get("id", ""))
-
-    _track_agents(visible_agents, self_data.get("id", ""), region_id)
-    move_ep_cost = _get_move_ep_cost(region_terrain, region_weather)
-    ep_ratio = ep / max_ep if max_ep > 0 else 1.0
-
-    # Deteksi musuh
-    enemies_here = [a for a in visible_agents
-                    if a.get("isAlive", True)
-                    and a.get("id") != self_data.get("id")
-                    and a.get("regionId") == region_id
-                    and not a.get("isGuardian", False)]
-    
-    guardians_here = [a for a in visible_agents
-                      if a.get("isGuardian", False) and a.get("isAlive", True)
-                      and a.get("regionId") == region_id]
-
-    # Hitung damage musuh terkuat
-    strongest_enemy_damage = 0
-    for enemy in enemies_here:
-        enemy_dmg = calc_damage(enemy.get("atk", 10),
-                               _estimate_enemy_weapon_bonus(enemy),
-                               defense, region_weather)
-        if enemy_dmg > strongest_enemy_damage:
-            strongest_enemy_damage = enemy_dmg
-
-    # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 1: DEATHZONE ESCAPE
-    # ═══════════════════════════════════════════════════════════════
-    if region.get("isDeathZone", False):
-        safe = _find_safe_region(connections, danger_ids, view)
-        if safe and ep >= move_ep_cost:
-            log.warning("DEATHZONE! Escaping to %s", safe)
-            return {"action": "move", "data": {"regionId": safe},
-                    "reason": "DEATHZONE ESCAPE"}
-
-    if region_id in danger_ids:
-        safe = _find_safe_region(connections, danger_ids, view)
-        if safe and ep >= move_ep_cost:
-            log.warning("Pending DZ! Escaping")
-            return {"action": "move", "data": {"regionId": safe},
-                    "reason": "PRE-ESCAPE"}
-
-    # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 2: HEALING DARURAT
-    # ═══════════════════════════════════════════════════════════════
-    if hp < BERSERKER_CONFIG["HEAL_CRITICAL"]:
-        heal = _find_healing_item(inventory, critical=True)
-        if heal:
-            log.warning("CRITICAL HEAL! HP=%d -> using %s", hp, heal.get("typeId", "heal"))
-            return {"action": "use_item", "data": {"itemId": heal["id"]},
-                    "reason": f"CRITICAL HEAL: HP={hp}"}
-
-    # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 3: FLEE (hanya jika benar-benar kritis)
-    # ═══════════════════════════════════════════════════════════════
-    should_flee = False
-    flee_reason = ""
-    
-    if _hunting_target:
-        if hp < 15:
-            should_flee = True
-            flee_reason = f"CRITICAL HP DURING HUNT ({hp})"
-    else:
-        if hp < BERSERKER_CONFIG["FLEE_HP"]:
-            should_flee = True
-            flee_reason = f"CRITICAL HP ({hp})"
-        elif strongest_enemy_damage > BERSERKER_CONFIG["FLEE_STRONG_ENEMY"] and hp < 50:
-            should_flee = True
-            flee_reason = f"ENEMY TOO STRONG (dmg={strongest_enemy_damage})"
-        elif len(enemies_here) >= BERSERKER_CONFIG["FLEE_OUTNUMBERED"] and hp < 60:
-            should_flee = True
-            flee_reason = f"OUTNUMBERED ({len(enemies_here)})"
-    
-    if should_flee:
-        safe = _find_safe_region(connections, danger_ids, view)
-        if safe and ep >= move_ep_cost:
-            log.warning("FLEEING: %s", flee_reason)
-            return {"action": "move", "data": {"regionId": safe},
-                    "reason": f"FLEE: {flee_reason}"}
-
-    # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 4: COUNTER ATTACK (PRIORITAS UTAMA!)
-    # ═══════════════════════════════════════════════════════════════
-    can_attack = (hp >= BERSERKER_CONFIG["MIN_HP_TO_ATTACK"] and 
-                  ep_ratio >= BERSERKER_CONFIG["EP_MIN_ATTACK"])
-    
-    if _hunting_target and hp >= 15:
-        can_attack = True
-    
-    if enemies_here and can_attack:
-        target = select_target_with_priority(enemies_here, _hunting_target)
-        
-        if target:
-            w_range = get_weapon_range(equipped)
-            
-            if _is_in_range(target, region_id, w_range, connections):
-                my_dmg = calc_damage(atk, get_weapon_bonus(equipped),
-                                    target.get("def", 5), region_weather)
-                enemy_hp = target.get("hp", 100)
-                
-                if BERSERKER_CONFIG["HUNTING_MODE"] and not _hunting_target:
-                    update_hunting_target(target)
-                
-                log.info("BERSERKER ATTACK! Target HP=%d, My DMG=%d, My HP=%d", 
-                        enemy_hp, my_dmg, hp)
-                
-                return {"action": "attack",
-                        "data": {"targetId": target["id"], "targetType": "agent"},
-                        "reason": f"BERSERKER: HP={enemy_hp}"}
-    
-    # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 5: GUARDIAN FARMING
-    # ═══════════════════════════════════════════════════════════════
-    guardians = [a for a in visible_agents
-                 if a.get("isGuardian", False) and a.get("isAlive", True)]
-    if guardians and ep >= 2 and hp >= 45 and not _hunting_target:
-        target = _select_weakest(guardians)
-        w_range = get_weapon_range(equipped)
-        if _is_in_range(target, region_id, w_range, connections):
-            log.info("GUARDIAN HUNT! 120 sMoltz!")
-            return {"action": "attack",
-                    "data": {"targetId": target["id"], "targetType": "agent"},
-                    "reason": "GUARDIAN: 120 sMoltz!"}
-
-    # ═══════════════════════════════════════════════════════════════
-    # FREE ACTIONS (pickup, equip, utility)
-    # ═══════════════════════════════════════════════════════════════
-    pickup_action = _check_pickup(visible_items, inventory, region_id)
-    if pickup_action:
-        return pickup_action
-
-    equip_action = _check_equip(inventory, equipped)
-    if equip_action:
-        return equip_action
-
-    util_action = _use_utility_item(inventory, hp, ep, alive_count)
-    if util_action:
-        return util_action
-
-    if not can_act:
-        return None
-
-    # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 6: FACILITY INTERACTION (DENGAN BATASAN!)
-    # ═══════════════════════════════════════════════════════════════
-    # Hanya interact facility jika TIDAK ADA MUSUH di region!
-    if not enemies_here and not guardians_here:
-        facility = _select_facility_with_limit(interactables, hp, ep, current_turn)
-        if facility:
-            fid = facility.get("id", "")
-            _interacted_facilities[fid] = current_turn
-            log.info("FACILITY INTERACT: %s", facility.get("type", "unknown"))
-            return {"action": "interact", "data": {"interactableId": facility["id"]},
-                    "reason": f"FACILITY: {facility.get('type', 'unknown')}"}
-
-    # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 7: MODERATE HEALING
-    # ═══════════════════════════════════════════════════════════════
-    if hp < BERSERKER_CONFIG["HEAL_MODERATE"] and not enemies_here and not _hunting_target:
-        heal = _find_healing_item(inventory, critical=False)
-        if heal:
-            log.info("MODERATE HEAL: HP=%d", hp)
-            return {"action": "use_item", "data": {"itemId": heal["id"]},
-                    "reason": f"HEAL: HP={hp}"}
-
-    # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 8: EP RECOVERY
-    # ═══════════════════════════════════════════════════════════════
-    if ep_ratio < BERSERKER_CONFIG["EP_SAFE"]:
-        energy_drink = _find_energy_drink(inventory)
-        if energy_drink:
-            return {"action": "use_item", "data": {"itemId": energy_drink["id"]},
-                    "reason": f"EP: {ep}/{max_ep}"}
-        
-        if not enemies_here and region_id not in danger_ids and not _hunting_target:
-            return {"action": "rest", "data": {},
-                    "reason": f"REST: EP={ep}/{max_ep}"}
-
-    # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 9: MONSTER FARMING
-    # ═══════════════════════════════════════════════════════════════
-    monsters = [m for m in visible_monsters if m.get("hp", 0) > 0]
-    if monsters and ep >= 1 and hp > 40 and not enemies_here and not _hunting_target:
-        target = _select_weakest(monsters)
-        w_range = get_weapon_range(equipped)
-        if _is_in_range(target, region_id, w_range, connections):
-            return {"action": "attack",
-                    "data": {"targetId": target["id"], "targetType": "monster"},
-                    "reason": f"MONSTER: HP={target.get('hp', '?')}"}
-
-    # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 10: MOVEMENT (KEJAR TARGET ATAU CARI AMAN)
-    # ═══════════════════════════════════════════════════════════════
-    if ep >= move_ep_cost and connections:
-        if _hunting_target:
-            target_region = _hunting_target.get("regionId", "")
-            if target_region and target_region != region_id and target_region not in danger_ids:
-                log.info("HUNTING: Moving to chase target!")
-                return {"action": "move", "data": {"regionId": target_region},
-                        "reason": "HUNTING: Kejar target!"}
-        
-        move_target = _choose_move_target(connections, danger_ids,
-                                           region, visible_items, alive_count)
-        if move_target:
-            return {"action": "move", "data": {"regionId": move_target},
-                    "reason": "MOVE: Strategic"}
-
-    # ═══════════════════════════════════════════════════════════════
-    # LAST RESORT: REST
-    # ═══════════════════════════════════════════════════════════════
-    if ep < 4 and not enemies_here and not region.get("isDeathZone") and region_id not in danger_ids:
-        return {"action": "rest", "data": {},
-                "reason": f"REST: EP={ep}/{max_ep}"}
-
-    return None
-
-
 """
-BERSERKER MODE v2.3 - FIX FACILITY LOOP
-
-PERUBAHAN PALING PENTING:
-1. ✅ BOT TIDAK AKAN STUCK DI FACILITY!
-2. ✅ Prioritas: COMBAT > FACILITY > MOVEMENT
-3. ✅ Facility hanya di-interact jika TIDAK ADA MUSUH
-4. ✅ Facility cooldown: tidak akan interact facility yang sama berulang-ulang
-5. ✅ Maksimal 1x interact per facility
+View fields from api-summary.md (all implemented above — v1.5.2):
+✅ self          — hp, ep, atk, def, inventory, equippedWeapon, isAlive
+✅ currentRegion — id, name, terrain, weather, connections, interactables, isDeathZone
+✅ connectedRegions — full Region objects OR bare string IDs (type-safe via _resolve_region)
+✅ visibleRegions  — used for connectedRegions fallback + region ID lookup
+✅ visibleAgents   — guardians (HOSTILE!) + enemies + combat targeting
+✅ visibleMonsters — monster farming targets
+✅ visibleNPCs     — acknowledged (NPCs are flavor per game-systems.md)
+✅ visibleItems    — pickup + movement attraction scoring
+✅ pendingDeathzones — {id, name} entries for death zone escape + movement planning
+✅ recentLogs      — available for analysis
+✅ recentMessages  — communication (curse disabled in v1.5.2)
+✅ aliveCount      — adaptive aggression (late game adjustment)
 """
