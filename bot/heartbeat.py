@@ -2,9 +2,10 @@
 Heartbeat loop — main orchestration per heartbeat.md.
 State machine: setup → join → play → settle → repeat.
 
-PERBAIKAN AGRESIF (v3):
-- Agent MATI → langsung skip + jeda panjang + refresh state
-- Mengurangi kemungkinan stuck di IN_GAME meskipun backend masih melaporkan active game
+VERSI FINAL (v3.1) - Dead Agent Fast Rejoin
+- Lebih stabil keluar dari IN_GAME ketika mati
+- Mengurangi spam log dead skip
+- Optimasi timing untuk join room kosong
 """
 
 import asyncio
@@ -40,6 +41,7 @@ class Heartbeat:
         self.running = True
         self._agent_key = "agent-1"
         self._agent_name = "Agent"
+        self._last_dead_skip_time = 0
 
     async def run(self):
         log.info("═══════════════════════════════════════════")
@@ -54,7 +56,6 @@ class Heartbeat:
         log.info("  AUTO_IDENTITY   = %s", AUTO_IDENTITY)
         log.info("  ROOM_MODE       = %s", ROOM_MODE)
 
-        # Phase 0: First-run account setup
         creds = None
         while self.running and not creds:
             try:
@@ -74,19 +75,16 @@ class Heartbeat:
         self.api = MoltyAPI(creds.get("api_key", "") or get_api_key())
 
         dashboard_state.bots_running = 1
-        dashboard_state.add_log("Bot started", "info")
+        dashboard_state.add_log("Bot started - Fast Rejoin Mode", "info")
 
         if ENABLE_MEMORY:
             await self.memory.load()
             if creds.get("agent_name"):
                 self.memory.set_agent_name(creds["agent_name"])
-        else:
-            log.info("Memory system disabled (ENABLE_MEMORY=false)")
 
-        log.info("Molty Royale AI Agent v2.1.0 - Dead Agent Fast Join Mode")
+        log.info("Molty Royale AI Agent v2.1.1 - Dead Agent Fast Rejoin Mode")
         log.info("Press Ctrl+C to stop")
 
-        # Main loop
         consecutive_errors = 0
         while self.running:
             try:
@@ -98,8 +96,7 @@ class Heartbeat:
             except Exception as e:
                 consecutive_errors += 1
                 wait = min(10 * (2 ** min(consecutive_errors - 1, 4)), 120)
-                log.error("Heartbeat error (#%d): %s. Retrying in %ds...", 
-                          consecutive_errors, e, wait)
+                log.error("Heartbeat error (#%d): %s. Retrying in %ds...", consecutive_errors, e, wait)
                 await asyncio.sleep(wait)
 
         if self.api:
@@ -117,7 +114,9 @@ class Heartbeat:
             raise
 
         state, ctx = determine_state(me)
-        log.info(f"State: {state} | Active Game: {ctx.get('game_id') if ctx else None}")
+        game_id = ctx.get("game_id") if ctx else None
+
+        log.info(f"State: {state} | Game: {game_id[:12] if game_id else 'None'}")
 
         self._agent_key = str(me.get("agentId", me.get("id", "agent-1")))
         self._agent_name = me.get("agentName", me.get("name", "Agent"))
@@ -128,7 +127,6 @@ class Heartbeat:
             "name": self._agent_name,
             "status": "playing" if state == IN_GAME else "idle",
             "smoltz": balance,
-            "whitelisted": state != NO_IDENTITY,
         })
 
         if state == NO_IDENTITY:
@@ -143,33 +141,24 @@ class Heartbeat:
             await self._handle_ready(me, state)
             return
 
-        # Fallback
-        log.warning("Unknown state, sleeping 10s...")
-        await asyncio.sleep(10)
+        await asyncio.sleep(5)
 
     async def _handle_no_identity(self, me: dict):
-        # Setup tetap sama
+        # Setup logic (disingkat)
+        log.info("Running setup pipeline...")
         creds = load_credentials() or {}
         owner_eoa = creds.get("owner_eoa", "")
-        agent_eoa = creds.get("agent_wallet_address", "")
-
-        if not owner_eoa:
-            log.error("Owner EOA not set.")
-            await asyncio.sleep(30)
-            return
-
-        if AUTO_SC_WALLET:
+        if owner_eoa and AUTO_SC_WALLET:
             await ensure_molty_wallet(self.api, owner_eoa)
-        if AUTO_WHITELIST:
-            await ensure_whitelist(self.api, owner_eoa, agent_eoa)
+        if owner_eoa and AUTO_WHITELIST:
+            await ensure_whitelist(self.api, owner_eoa, creds.get("agent_wallet_address", ""))
         if AUTO_IDENTITY:
             await ensure_identity(self.api)
-
-        log.info("✅ Full setup complete!")
+        log.info("✅ Setup completed.")
 
     async def _handle_ready(self, me: dict, state: str):
         room_type = select_room(me)
-        log.info(f"→ Attempting to join {room_type.upper()} room...")
+        log.info(f"→ Trying to join {room_type.upper()} room...")
 
         try:
             if room_type == "paid":
@@ -177,31 +166,24 @@ class Heartbeat:
             else:
                 game_id, agent_id = await join_free_game(self.api)
 
-            log.info(f"✅ Successfully joined {room_type} game: {game_id[:12]}...")
+            log.info(f"✅ Joined {room_type} game: {game_id}")
             await self._play_game(game_id, agent_id, room_type)
         except Exception as e:
-            log.warning(f"Join failed: {e}. Retrying in 12s.")
-            await asyncio.sleep(12)
+            log.warning(f"Join {room_type} failed: {e}")
+            await asyncio.sleep(8)
 
     async def _handle_in_game(self, ctx: dict):
         game_id = ctx.get("game_id")
         is_alive = ctx.get("is_alive", True)
 
         if not is_alive:
-            log.warning(f"Agent MATI di game {game_id}. Melewati game ini (dead skip mode).")
-            dashboard_state.add_log(f"Dead skip → waiting to rejoin new room", "warning", self._agent_key)
-            
-            # Jeda panjang + refresh state
-            await asyncio.sleep(8)
-            
-            # Refresh state sekali lagi
-            try:
-                me = await self.api.get_accounts_me()
-                state, ctx = determine_state(me)
-                log.info(f"State refresh after dead skip: {state}")
-            except:
-                pass
-                
+            current_time = asyncio.get_event_loop().time()
+            if current_time - self._last_dead_skip_time > 15:   # batasi spam log
+                log.warning(f"Agent MATI di game {game_id[:12]}. Skipping & waiting for new room...")
+                dashboard_state.add_log(f"Dead → skipping game {game_id[:12]}", "warning", self._agent_key)
+                self._last_dead_skip_time = current_time
+
+            await asyncio.sleep(7)   # jeda optimal
             return
 
         # Masih hidup
@@ -209,14 +191,13 @@ class Heartbeat:
         await self._play_game(game_id, ctx.get("agent_id"), entry_type)
 
     async def _play_game(self, game_id: str, agent_id: str, entry_type: str):
-        log.info(f"═══ PLAYING GAME: {game_id} (type={entry_type}) ═══")
+        log.info(f"═══ PLAYING GAME: {game_id[:12]} (type={entry_type}) ═══")
 
         dashboard_state.update_agent(self._agent_key, {
             "status": "playing",
             "room_id": game_id,
-            "room_name": entry_type + " room",
+            "room_name": f"{entry_type} room",
         })
-        dashboard_state.add_log(f"Joined {entry_type} game", "info", self._agent_key)
 
         self.memory.set_temp_game(game_id)
         await self.memory.save()
@@ -232,8 +213,7 @@ class Heartbeat:
         else:
             await settle_game(game_result, entry_type, self.memory)
 
-        log.info("Game cycle selesai. Next cycle...")
-        await asyncio.sleep(3)
+        await asyncio.sleep(4)
 
 
 if __name__ == "__main__":
