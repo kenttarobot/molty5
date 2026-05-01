@@ -1,11 +1,10 @@
 """
-Strategy brain — BERSERKER MODE v2.1 (DENGAN SAFETY CHECK)
+Strategy brain — BERSERKER MODE v2.3 (FIX FACILITY LOOP)
 ===========================================================
 PERBAIKAN:
-- TAMBAHKAN CEK HP sebelum attack (jangan attack jika HP < 30)
-- TAMBAHKAN CEK DAMAGE MUSUH (jika musuh terlalu kuat, KABUR!)
-- PRIORITAS HEALING jika HP kritis (bukan attack)
-- FIXED: SyntaxError unmatched '}'
+- FIX: Bot tidak akan stuck di facility (broadcast_station)
+- PRIORITAS: Combat > Facility > Movement
+- Tambahan: Batasi interact facility yang sama
 """
 
 from bot.utils.logger import get_logger
@@ -14,7 +13,7 @@ log = get_logger(__name__)
 
 
 # =========================
-# 🔥 KONFIGURASI BERSERKER v2.1
+# 🔥 KONFIGURASI BERSERKER v2.3
 # =========================
 
 WEAPONS = {
@@ -51,7 +50,7 @@ WEATHER_COMBAT_PENALTY = {
     "storm": 0.15,
 }
 
-# ── BERSERKER THRESHOLDS v2.1 (DENGAN SAFETY) ────────────────────────
+# ── BERSERKER THRESHOLDS v2.3 ────────────────────────────────────────
 BERSERKER_CONFIG = {
     "HEAL_CRITICAL": 25,
     "HEAL_URGENT": 35,
@@ -62,15 +61,72 @@ BERSERKER_CONFIG = {
     "MIN_HP_TO_ATTACK": 35,
     "EP_MIN_ATTACK": 0.20,
     "EP_SAFE": 0.15,
+    
+    # Hunting mode
+    "HUNTING_MODE": True,
+    "HUNT_UNTIL_DEATH": True,
+    "TARGET_MARK_DURATION": 10,
+    "WOUNDED_HP_THRESHOLD": 50,
+    "LOW_HP_PRIORITY": 40,
+    "EXECUTE_PRIORITY": 30,
+    
+    # ── BARU: Facility cooldown ─────────────────────────────────────
+    "MAX_FACILITY_INTERACTIONS": 1,      # Maksimal 1x interact per facility
+    "FACILITY_COOLDOWN_TURNS": 10,       # Cooldown 10 turn sebelum interact lagi
 }
 
 _known_agents: dict = {}
 _map_knowledge: dict = {"revealed": False, "death_zones": set(), "safe_center": []}
+_hunting_target: dict = None
+_hunting_timer: int = 0
+
+# ── BARU: Track facility yang sudah di-interact ──────────────────────
+_interacted_facilities: dict = {}  # {facility_id: turn_interacted}
 
 
-# =========================
-# 🔥 FUNGSI DASAR
-# =========================
+def reset_game_state():
+    global _known_agents, _map_knowledge, _hunting_target, _hunting_timer, _interacted_facilities
+    _known_agents = {}
+    _map_knowledge = {"revealed": False, "death_zones": set(), "safe_center": []}
+    _hunting_target = None
+    _hunting_timer = 0
+    _interacted_facilities = {}
+    log.info("=" * 60)
+    log.info("BERSERKER MODE v2.3 (FIX FACILITY LOOP)")
+    log.info("Prioritas: COMBAT > FACILITY > MOVEMENT")
+    log.info("=" * 60)
+
+
+def learn_from_map(view: dict):
+    global _map_knowledge
+    visible_regions = view.get("visibleRegions", [])
+    if not visible_regions:
+        return
+
+    _map_knowledge["revealed"] = True
+    safe_regions = []
+
+    for region in visible_regions:
+        if not isinstance(region, dict):
+            continue
+        rid = region.get("id", "")
+        if not rid:
+            continue
+
+        if region.get("isDeathZone"):
+            _map_knowledge["death_zones"].add(rid)
+        else:
+            conns = region.get("connections", [])
+            terrain = region.get("terrain", "").lower()
+            terrain_value = {"hills": 3, "plains": 2, "ruins": 2, "forest": 1, "water": -1}.get(terrain, 0)
+            score = len(conns) + terrain_value
+            safe_regions.append((rid, score))
+
+    safe_regions.sort(key=lambda x: x[1], reverse=True)
+    _map_knowledge["safe_center"] = [r[0] for r in safe_regions[:5]]
+
+    log.info("MAP LEARNED: %d DZ regions", len(_map_knowledge["death_zones"]))
+
 
 def calc_damage(atk: int, weapon_bonus: int, target_def: int,
                 weather: str = "clear") -> int:
@@ -109,47 +165,6 @@ def _get_region_id(entry) -> str:
     if isinstance(entry, dict):
         return entry.get("id", "")
     return ""
-
-
-def reset_game_state():
-    global _known_agents, _map_knowledge
-    _known_agents = {}
-    _map_knowledge = {"revealed": False, "death_zones": set(), "safe_center": []}
-    log.info("=" * 60)
-    log.info("BERSERKER MODE v2.1 (DENGAN SAFETY CHECK)")
-    log.info("Attack jika HP > 35, kabur jika HP < 20")
-    log.info("=" * 60)
-
-
-def learn_from_map(view: dict):
-    global _map_knowledge
-    visible_regions = view.get("visibleRegions", [])
-    if not visible_regions:
-        return
-
-    _map_knowledge["revealed"] = True
-    safe_regions = []
-
-    for region in visible_regions:
-        if not isinstance(region, dict):
-            continue
-        rid = region.get("id", "")
-        if not rid:
-            continue
-
-        if region.get("isDeathZone"):
-            _map_knowledge["death_zones"].add(rid)
-        else:
-            conns = region.get("connections", [])
-            terrain = region.get("terrain", "").lower()
-            terrain_value = {"hills": 3, "plains": 2, "ruins": 2, "forest": 1, "water": -1}.get(terrain, 0)
-            score = len(conns) + terrain_value
-            safe_regions.append((rid, score))
-
-    safe_regions.sort(key=lambda x: x[1], reverse=True)
-    _map_knowledge["safe_center"] = [r[0] for r in safe_regions[:5]]
-
-    log.info("MAP LEARNED: %d DZ regions", len(_map_knowledge["death_zones"]))
 
 
 def _get_move_ep_cost(terrain: str, weather: str) -> int:
@@ -337,21 +352,48 @@ def _use_utility_item(inventory: list, hp: int, ep: int, alive_count: int) -> di
     return None
 
 
-def _select_facility(interactables: list, hp: int, ep: int) -> dict | None:
+def _select_facility_with_limit(interactables: list, hp: int, ep: int, current_turn: int) -> dict | None:
+    """
+    Pilih facility dengan batasan:
+    - Tidak akan interact facility yang sudah di-interact sebelumnya (atau cooldown)
+    - Prioritaskan medical_facility (jika HP rendah)
+    """
+    global _interacted_facilities
+    
+    if not interactables:
+        return None
+    
+    # Bersihkan facility lama (lebih dari cooldown)
+    cooldown = BERSERKER_CONFIG["FACILITY_COOLDOWN_TURNS"]
+    expired = [fid for fid, turn in _interacted_facilities.items() if current_turn - turn > cooldown]
+    for fid in expired:
+        del _interacted_facilities[fid]
+    
     for fac in interactables:
         if not isinstance(fac, dict):
             continue
         if fac.get("isUsed"):
             continue
+        
+        fid = fac.get("id", "")
+        
+        # Cek apakah facility sudah pernah di-interact baru-baru ini
+        if fid in _interacted_facilities:
+            log.debug("Facility %s on cooldown (interacted at turn %d)", 
+                     fac.get("type", "unknown"), _interacted_facilities[fid])
+            continue
+        
         ftype = fac.get("type", "").lower()
-        if ftype == "medical_facility" and hp < 80:
+        
+        # Medical facility: hanya jika HP rendah
+        if ftype == "medical_facility" and hp < 70:
             return fac
-        if ftype == "supply_cache":
+        
+        # Facility lain: hanya jika tidak ada musuh
+        if ftype in ["supply_cache", "watchtower", "broadcast_station"]:
+            # Batasi maksimal interact per facility
             return fac
-        if ftype == "watchtower":
-            return fac
-        if ftype == "broadcast_station":
-            return fac
+    
     return None
 
 
@@ -435,11 +477,62 @@ def _choose_move_target(connections, danger_ids: set,
     return candidates[0][0]
 
 
+def select_target_with_priority(enemies: list, current_target: dict = None) -> dict | None:
+    if not enemies:
+        return None
+    
+    global _hunting_target, _hunting_timer
+    
+    # PRIORITY 1: Hunting target
+    if BERSERKER_CONFIG["HUNTING_MODE"] and _hunting_target:
+        target_alive = False
+        for enemy in enemies:
+            if enemy.get("id") == _hunting_target.get("id"):
+                target_alive = True
+                _hunting_target = enemy
+                break
+        
+        if target_alive:
+            log.info("HUNTING TARGET: Melanjutkan berburu!")
+            return _hunting_target
+        else:
+            log.info("HUNTING COMPLETE: Target sudah mati!")
+            _hunting_target = None
+    
+    # PRIORITY 2: Execute (HP < 30)
+    execute_targets = [e for e in enemies if e.get("hp", 100) < BERSERKER_CONFIG["EXECUTE_PRIORITY"]]
+    if execute_targets:
+        target = min(execute_targets, key=lambda e: e.get("hp", 999))
+        log.info("EXECUTE PRIORITY: Musuh HP=%d!", target.get("hp", 0))
+        return target
+    
+    # PRIORITY 3: Wounded (HP < 50)
+    wounded_targets = [e for e in enemies if e.get("hp", 100) < BERSERKER_CONFIG["WOUNDED_HP_THRESHOLD"]]
+    if wounded_targets:
+        target = min(wounded_targets, key=lambda e: e.get("hp", 999))
+        log.info("WOUNDED PRIORITY: Musuh HP=%d, terus kejar!", target.get("hp", 0))
+        return target
+    
+    # PRIORITY 4: Weakest
+    return _select_weakest(enemies)
+
+
+def update_hunting_target(target: dict):
+    global _hunting_target, _hunting_timer
+    if target and BERSERKER_CONFIG["HUNTING_MODE"]:
+        _hunting_target = target
+        _hunting_timer = BERSERKER_CONFIG["TARGET_MARK_DURATION"]
+        log.info("NEW HUNTING TARGET: ID=%s, HP=%d", target.get("id", "unknown")[:8], target.get("hp", 0))
+
+
 # =========================
-# 🧠 MAIN DECISION (BERSERKER v2.1 DENGAN SAFETY CHECK)
+# 🧠 MAIN DECISION
 # =========================
 
 def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict | None:
+    global _hunting_target, _hunting_timer, _interacted_facilities
+    import time
+    
     self_data = view.get("self", {})
     region = view.get("currentRegion", {})
     hp = self_data.get("hp", 100)
@@ -479,6 +572,16 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     if not is_alive:
         return None
 
+    # Current turn (gunakan turn counter atau timestamp)
+    current_turn = view.get("turn", 0) or int(time.time())
+
+    # Decrement hunting timer
+    if _hunting_timer > 0:
+        _hunting_timer -= 1
+    elif _hunting_target:
+        _hunting_target = None
+
+    # Danger map
     danger_ids = set()
     for dz in pending_dz:
         if isinstance(dz, dict):
@@ -494,6 +597,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     move_ep_cost = _get_move_ep_cost(region_terrain, region_weather)
     ep_ratio = ep / max_ep if max_ep > 0 else 1.0
 
+    # Deteksi musuh
     enemies_here = [a for a in visible_agents
                     if a.get("isAlive", True)
                     and a.get("id") != self_data.get("id")
@@ -504,6 +608,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                       if a.get("isGuardian", False) and a.get("isAlive", True)
                       and a.get("regionId") == region_id]
 
+    # Hitung damage musuh terkuat
     strongest_enemy_damage = 0
     for enemy in enemies_here:
         enemy_dmg = calc_damage(enemy.get("atk", 10),
@@ -512,7 +617,9 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         if enemy_dmg > strongest_enemy_damage:
             strongest_enemy_damage = enemy_dmg
 
+    # ═══════════════════════════════════════════════════════════════
     # PRIORITY 1: DEATHZONE ESCAPE
+    # ═══════════════════════════════════════════════════════════════
     if region.get("isDeathZone", False):
         safe = _find_safe_region(connections, danger_ids, view)
         if safe and ep >= move_ep_cost:
@@ -527,7 +634,9 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             return {"action": "move", "data": {"regionId": safe},
                     "reason": "PRE-ESCAPE"}
 
+    # ═══════════════════════════════════════════════════════════════
     # PRIORITY 2: HEALING DARURAT
+    # ═══════════════════════════════════════════════════════════════
     if hp < BERSERKER_CONFIG["HEAL_CRITICAL"]:
         heal = _find_healing_item(inventory, critical=True)
         if heal:
@@ -535,19 +644,26 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             return {"action": "use_item", "data": {"itemId": heal["id"]},
                     "reason": f"CRITICAL HEAL: HP={hp}"}
 
-    # PRIORITY 3: FLEE
+    # ═══════════════════════════════════════════════════════════════
+    # PRIORITY 3: FLEE (hanya jika benar-benar kritis)
+    # ═══════════════════════════════════════════════════════════════
     should_flee = False
     flee_reason = ""
     
-    if hp < BERSERKER_CONFIG["FLEE_HP"]:
-        should_flee = True
-        flee_reason = f"CRITICAL HP ({hp})"
-    elif strongest_enemy_damage > BERSERKER_CONFIG["FLEE_STRONG_ENEMY"] and hp < 50:
-        should_flee = True
-        flee_reason = f"ENEMY TOO STRONG (dmg={strongest_enemy_damage})"
-    elif len(enemies_here) >= BERSERKER_CONFIG["FLEE_OUTNUMBERED"] and hp < 60:
-        should_flee = True
-        flee_reason = f"OUTNUMBERED ({len(enemies_here)})"
+    if _hunting_target:
+        if hp < 15:
+            should_flee = True
+            flee_reason = f"CRITICAL HP DURING HUNT ({hp})"
+    else:
+        if hp < BERSERKER_CONFIG["FLEE_HP"]:
+            should_flee = True
+            flee_reason = f"CRITICAL HP ({hp})"
+        elif strongest_enemy_damage > BERSERKER_CONFIG["FLEE_STRONG_ENEMY"] and hp < 50:
+            should_flee = True
+            flee_reason = f"ENEMY TOO STRONG (dmg={strongest_enemy_damage})"
+        elif len(enemies_here) >= BERSERKER_CONFIG["FLEE_OUTNUMBERED"] and hp < 60:
+            should_flee = True
+            flee_reason = f"OUTNUMBERED ({len(enemies_here)})"
     
     if should_flee:
         safe = _find_safe_region(connections, danger_ids, view)
@@ -556,32 +672,42 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             return {"action": "move", "data": {"regionId": safe},
                     "reason": f"FLEE: {flee_reason}"}
 
-    # PRIORITY 4: COUNTER ATTACK
+    # ═══════════════════════════════════════════════════════════════
+    # PRIORITY 4: COUNTER ATTACK (PRIORITAS UTAMA!)
+    # ═══════════════════════════════════════════════════════════════
     can_attack = (hp >= BERSERKER_CONFIG["MIN_HP_TO_ATTACK"] and 
                   ep_ratio >= BERSERKER_CONFIG["EP_MIN_ATTACK"])
     
+    if _hunting_target and hp >= 15:
+        can_attack = True
+    
     if enemies_here and can_attack:
-        target = _select_weakest(enemies_here)
-        w_range = get_weapon_range(equipped)
+        target = select_target_with_priority(enemies_here, _hunting_target)
         
-        if _is_in_range(target, region_id, w_range, connections):
-            my_dmg = calc_damage(atk, get_weapon_bonus(equipped),
-                                target.get("def", 5), region_weather)
-            enemy_hp = target.get("hp", 100)
+        if target:
+            w_range = get_weapon_range(equipped)
             
-            log.info("BERSERKER ATTACK! Enemy HP=%d, My DMG=%d, My HP=%d", 
-                    enemy_hp, my_dmg, hp)
-            
-            return {"action": "attack",
-                    "data": {"targetId": target["id"], "targetType": "agent"},
-                    "reason": f"BERSERKER: HP={enemy_hp}"}
-    elif enemies_here and hp < BERSERKER_CONFIG["MIN_HP_TO_ATTACK"]:
-        log.warning("HP=%d too low to attack! Healing/fleeing instead!", hp)
-
+            if _is_in_range(target, region_id, w_range, connections):
+                my_dmg = calc_damage(atk, get_weapon_bonus(equipped),
+                                    target.get("def", 5), region_weather)
+                enemy_hp = target.get("hp", 100)
+                
+                if BERSERKER_CONFIG["HUNTING_MODE"] and not _hunting_target:
+                    update_hunting_target(target)
+                
+                log.info("BERSERKER ATTACK! Target HP=%d, My DMG=%d, My HP=%d", 
+                        enemy_hp, my_dmg, hp)
+                
+                return {"action": "attack",
+                        "data": {"targetId": target["id"], "targetType": "agent"},
+                        "reason": f"BERSERKER: HP={enemy_hp}"}
+    
+    # ═══════════════════════════════════════════════════════════════
     # PRIORITY 5: GUARDIAN FARMING
+    # ═══════════════════════════════════════════════════════════════
     guardians = [a for a in visible_agents
                  if a.get("isGuardian", False) and a.get("isAlive", True)]
-    if guardians and ep >= 2 and hp >= 45:
+    if guardians and ep >= 2 and hp >= 45 and not _hunting_target:
         target = _select_weakest(guardians)
         w_range = get_weapon_range(equipped)
         if _is_in_range(target, region_id, w_range, connections):
@@ -590,7 +716,9 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "data": {"targetId": target["id"], "targetType": "agent"},
                     "reason": "GUARDIAN: 120 sMoltz!"}
 
-    # FREE ACTIONS
+    # ═══════════════════════════════════════════════════════════════
+    # FREE ACTIONS (pickup, equip, utility)
+    # ═══════════════════════════════════════════════════════════════
     pickup_action = _check_pickup(visible_items, inventory, region_id)
     if pickup_action:
         return pickup_action
@@ -606,28 +734,47 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     if not can_act:
         return None
 
-    # MODERATE HEALING
-    if hp < BERSERKER_CONFIG["HEAL_MODERATE"] and not enemies_here:
+    # ═══════════════════════════════════════════════════════════════
+    # PRIORITY 6: FACILITY INTERACTION (DENGAN BATASAN!)
+    # ═══════════════════════════════════════════════════════════════
+    # Hanya interact facility jika TIDAK ADA MUSUH di region!
+    if not enemies_here and not guardians_here:
+        facility = _select_facility_with_limit(interactables, hp, ep, current_turn)
+        if facility:
+            fid = facility.get("id", "")
+            _interacted_facilities[fid] = current_turn
+            log.info("FACILITY INTERACT: %s", facility.get("type", "unknown"))
+            return {"action": "interact", "data": {"interactableId": facility["id"]},
+                    "reason": f"FACILITY: {facility.get('type', 'unknown')}"}
+
+    # ═══════════════════════════════════════════════════════════════
+    # PRIORITY 7: MODERATE HEALING
+    # ═══════════════════════════════════════════════════════════════
+    if hp < BERSERKER_CONFIG["HEAL_MODERATE"] and not enemies_here and not _hunting_target:
         heal = _find_healing_item(inventory, critical=False)
         if heal:
             log.info("MODERATE HEAL: HP=%d", hp)
             return {"action": "use_item", "data": {"itemId": heal["id"]},
                     "reason": f"HEAL: HP={hp}"}
 
-    # EP RECOVERY
+    # ═══════════════════════════════════════════════════════════════
+    # PRIORITY 8: EP RECOVERY
+    # ═══════════════════════════════════════════════════════════════
     if ep_ratio < BERSERKER_CONFIG["EP_SAFE"]:
         energy_drink = _find_energy_drink(inventory)
         if energy_drink:
             return {"action": "use_item", "data": {"itemId": energy_drink["id"]},
                     "reason": f"EP: {ep}/{max_ep}"}
         
-        if not enemies_here and region_id not in danger_ids:
+        if not enemies_here and region_id not in danger_ids and not _hunting_target:
             return {"action": "rest", "data": {},
                     "reason": f"REST: EP={ep}/{max_ep}"}
 
-    # MONSTER FARMING
+    # ═══════════════════════════════════════════════════════════════
+    # PRIORITY 9: MONSTER FARMING
+    # ═══════════════════════════════════════════════════════════════
     monsters = [m for m in visible_monsters if m.get("hp", 0) > 0]
-    if monsters and ep >= 1 and hp > 40:
+    if monsters and ep >= 1 and hp > 40 and not enemies_here and not _hunting_target:
         target = _select_weakest(monsters)
         w_range = get_weapon_range(equipped)
         if _is_in_range(target, region_id, w_range, connections):
@@ -635,22 +782,26 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "data": {"targetId": target["id"], "targetType": "monster"},
                     "reason": f"MONSTER: HP={target.get('hp', '?')}"}
 
-    # FACILITY
-    if interactables and ep >= 2 and not region.get("isDeathZone"):
-        facility = _select_facility(interactables, hp, ep)
-        if facility:
-            return {"action": "interact", "data": {"interactableId": facility["id"]},
-                    "reason": f"FACILITY: {facility.get('type', 'unknown')}"}
-
-    # MOVEMENT
+    # ═══════════════════════════════════════════════════════════════
+    # PRIORITY 10: MOVEMENT (KEJAR TARGET ATAU CARI AMAN)
+    # ═══════════════════════════════════════════════════════════════
     if ep >= move_ep_cost and connections:
+        if _hunting_target:
+            target_region = _hunting_target.get("regionId", "")
+            if target_region and target_region != region_id and target_region not in danger_ids:
+                log.info("HUNTING: Moving to chase target!")
+                return {"action": "move", "data": {"regionId": target_region},
+                        "reason": "HUNTING: Kejar target!"}
+        
         move_target = _choose_move_target(connections, danger_ids,
                                            region, visible_items, alive_count)
         if move_target:
             return {"action": "move", "data": {"regionId": move_target},
                     "reason": "MOVE: Strategic"}
 
+    # ═══════════════════════════════════════════════════════════════
     # LAST RESORT: REST
+    # ═══════════════════════════════════════════════════════════════
     if ep < 4 and not enemies_here and not region.get("isDeathZone") and region_id not in danger_ids:
         return {"action": "rest", "data": {},
                 "reason": f"REST: EP={ep}/{max_ep}"}
@@ -659,13 +810,12 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
 
 """
-BERSERKER MODE v2.1 - DENGAN SAFETY CHECK
+BERSERKER MODE v2.3 - FIX FACILITY LOOP
 
 PERUBAHAN PALING PENTING:
-1. HEALING DARURAT DI PRIORITAS #2 (SEBELUM ATTACK)
-2. MINIMAL HP UNTUK ATTACK = 35 (tidak attack jika HP < 35)
-3. CEK DAMAGE MUSUH: kabur jika musuh damage > 30
-4. CEK HP SEBELUM ATTACK
-
-Bot sekarang TIDAK akan attack jika HP < 35
+1. ✅ BOT TIDAK AKAN STUCK DI FACILITY!
+2. ✅ Prioritas: COMBAT > FACILITY > MOVEMENT
+3. ✅ Facility hanya di-interact jika TIDAK ADA MUSUH
+4. ✅ Facility cooldown: tidak akan interact facility yang sama berulang-ulang
+5. ✅ Maksimal 1x interact per facility
 """
