@@ -2,10 +2,11 @@
 Heartbeat loop — main orchestration per heartbeat.md.
 State machine: setup → join → play → settle → repeat.
 
-PERBAIKAN TERBARU:
-- Jika agent MATI → panggil leave_game() agar keluar dari active game
-- Baru setelah itu lanjut join room baru (mencegah stuck di IN_GAME)
-- Early exit + leave logic untuk meningkatkan join rate
+PERBAIKAN TERBARU (v2):
+- Agent yang MATI tidak lagi stuck di IN_GAME
+- Skip play_game dan langsung kembali ke cycle utama
+- Tambah jeda yang cukup agar state_router bisa update
+- Tidak bergantung pada method leave_game yang belum ada
 """
 
 import asyncio
@@ -43,7 +44,6 @@ class Heartbeat:
         self._agent_name = "Agent"
 
     async def run(self):
-        """Entry point — runs the heartbeat loop indefinitely."""
         log.info("═══════════════════════════════════════════")
         log.info("  MOLTY ROYALE AI AGENT — STARTING")
         log.info("═══════════════════════════════════════════")
@@ -106,7 +106,6 @@ class Heartbeat:
         log.info("Agent stopped.")
 
     async def _heartbeat_cycle(self):
-        """Single heartbeat cycle."""
         try:
             me = await self.api.get_accounts_me()
         except APIError as e:
@@ -144,7 +143,6 @@ class Heartbeat:
             return
 
     async def _handle_no_identity(self, me: dict):
-        """Setup pipeline."""
         creds = load_credentials() or {}
         owner_eoa = creds.get("owner_eoa", "")
         agent_eoa = creds.get("agent_wallet_address", "")
@@ -184,47 +182,39 @@ class Heartbeat:
     async def _handle_ready(self, me: dict, state: str):
         """Join a new game."""
         room_type = select_room(me)
+        log.info(f"Attempting to join {room_type} room...")
 
         try:
             if room_type == "paid":
                 game_id, agent_id = await join_paid_game(self.api)
             else:
                 game_id, agent_id = await join_free_game(self.api)
+
+            log.info(f"✅ Successfully joined {room_type} game: {game_id}")
+            await self._play_game(game_id, agent_id, room_type)
         except Exception as e:
             log.warning("Join failed: %s. Retrying in 10s.", e)
             await asyncio.sleep(10)
-            return
-
-        await self._play_game(game_id, agent_id, room_type)
 
     async def _handle_in_game(self, ctx: dict):
-        """Handle active game — Jika mati maka leave game agar bisa join baru."""
+        """Handle active game — Jika mati maka langsung skip dan kembali ke cycle."""
         game_id = ctx.get("game_id")
         agent_id = ctx.get("agent_id")
-        entry_type = ctx.get("entry_type", "free")
         is_alive = ctx.get("is_alive", True)
 
         if not is_alive:
-            log.info(f"Agent MATI di game {game_id}. Mencoba keluar dari game...")
-
-            try:
-                # Coba leave game agar tidak stuck di IN_GAME
-                await self.api.leave_game(game_id, agent_id)
-                log.info(f"✅ Berhasil leave game {game_id}. Siap join room baru.")
-                dashboard_state.add_log(f"Left dead game {game_id[:12]}", "success", self._agent_key)
-            except AttributeError:
-                log.warning("Method leave_game tidak ditemukan di MoltyAPI. Agent mungkin tetap terdeteksi di IN_GAME.")
-            except Exception as e:
-                log.warning(f"Gagal leave game {game_id}: {e}")
-
-            await asyncio.sleep(4)  # beri jeda agar state router update
+            log.info(f"Agent MATI di game {game_id}. Melewati game ini dan akan mencoba join room baru di cycle berikutnya.")
+            dashboard_state.add_log(f"Agent mati di {game_id[:12]} → skip & retry join", "warning", self._agent_key)
+            
+            # Jeda lebih panjang agar state_router punya waktu update status game
+            await asyncio.sleep(5)
             return
 
-        # Masih hidup → lanjut main game
+        # Masih hidup → main game normal
+        entry_type = ctx.get("entry_type", "free")
         await self._play_game(game_id, agent_id, entry_type)
 
     async def _play_game(self, game_id: str, agent_id: str, entry_type: str):
-        """Run gameplay engine."""
         log.info("═══ PLAYING GAME: %s (type=%s) ═══", game_id, entry_type)
 
         dashboard_state.update_agent(self._agent_key, {
@@ -245,7 +235,6 @@ class Heartbeat:
 
         # Settlement
         if game_result and game_result.get("status") == "dead":
-            log.info(f"Agent mati di game {game_id} → early settlement.")
             await settle_game(game_result, entry_type, self.memory, early_exit=True)
         else:
             await settle_game(game_result, entry_type, self.memory)
@@ -255,5 +244,7 @@ class Heartbeat:
 
 
 if __name__ == "__main__":
+    log.info("Molty Royale AI Agent v2.0.0")
+    log.info("Press Ctrl+C to stop")
     heartbeat = Heartbeat()
     asyncio.run(heartbeat.run())
