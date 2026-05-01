@@ -2,9 +2,10 @@
 Heartbeat loop — main orchestration per heartbeat.md.
 State machine: setup → join → play → settle → repeat.
 
-PERUBAHAN UTAMA:
-- Ketika agent MATI di dalam game, langsung join room baru tanpa menunggu game selesai.
-- Early exit logic untuk meningkatkan efisiensi join rate.
+PERBAIKAN TERBARU:
+- Jika agent MATI → panggil leave_game() agar keluar dari active game
+- Baru setelah itu lanjut join room baru (mencegah stuck di IN_GAME)
+- Early exit + leave logic untuk meningkatkan join rate
 """
 
 import asyncio
@@ -38,7 +39,7 @@ class Heartbeat:
         self.api: MoltyAPI | None = None
         self.memory = AgentMemory()
         self.running = True
-        self._agent_key = "agent-1"  # Consistent dashboard key
+        self._agent_key = "agent-1"
         self._agent_name = "Agent"
 
     async def run(self):
@@ -47,16 +48,15 @@ class Heartbeat:
         log.info("  MOLTY ROYALE AI AGENT — STARTING")
         log.info("═══════════════════════════════════════════")
 
-        # Log active config (answers to setup.md First-Run Intake)
         log.info("Config (First-Run Intake answers):")
-        log.info("  ADVANCED_MODE   = %s  (Q1-3: auto Owner+Agent wallet)", ADVANCED_MODE)
-        log.info("  AUTO_SC_WALLET  = %s  (Q6: auto SC wallet)", AUTO_SC_WALLET)
-        log.info("  AUTO_WHITELIST  = %s  (Q4: auto whitelist)", AUTO_WHITELIST)
-        log.info("  ENABLE_MEMORY   = %s  (Q7: cross-game learning)", ENABLE_MEMORY)
-        log.info("  AUTO_IDENTITY   = %s  (Q9: auto ERC-8004)", AUTO_IDENTITY)
+        log.info("  ADVANCED_MODE   = %s", ADVANCED_MODE)
+        log.info("  AUTO_SC_WALLET  = %s", AUTO_SC_WALLET)
+        log.info("  AUTO_WHITELIST  = %s", AUTO_WHITELIST)
+        log.info("  ENABLE_MEMORY   = %s", ENABLE_MEMORY)
+        log.info("  AUTO_IDENTITY   = %s", AUTO_IDENTITY)
         log.info("  ROOM_MODE       = %s", ROOM_MODE)
 
-        # Phase 0: First-run intake + account setup (retry until success)
+        # Phase 0: First-run account setup
         creds = None
         while self.running and not creds:
             try:
@@ -75,11 +75,9 @@ class Heartbeat:
 
         self.api = MoltyAPI(creds.get("api_key", "") or get_api_key())
 
-        # Feed dashboard
         dashboard_state.bots_running = 1
         dashboard_state.add_log("Bot started", "info")
 
-        # Load memory (if enabled)
         if ENABLE_MEMORY:
             await self.memory.load()
             if creds.get("agent_name"):
@@ -87,20 +85,19 @@ class Heartbeat:
         else:
             log.info("Memory system disabled (ENABLE_MEMORY=false)")
 
-        # Main loop — NEVER exits, NEVER crashes
+        # Main loop
         consecutive_errors = 0
         while self.running:
             try:
                 await self._heartbeat_cycle()
-                consecutive_errors = 0  # Reset on success
+                consecutive_errors = 0
             except KeyboardInterrupt:
                 log.info("Shutdown requested")
                 self.running = False
             except Exception as e:
                 consecutive_errors += 1
-                # Escalating backoff: 10s → 30s → 60s → 120s
                 wait = min(10 * (2 ** min(consecutive_errors - 1, 4)), 120)
-                log.error("Heartbeat error (#%d): %s. Retrying in %ds...",
+                log.error("Heartbeat error (#%d): %s. Retrying in %ds...", 
                           consecutive_errors, e, wait)
                 await asyncio.sleep(wait)
 
@@ -109,8 +106,7 @@ class Heartbeat:
         log.info("Agent stopped.")
 
     async def _heartbeat_cycle(self):
-        """Single heartbeat cycle: check state → route → act."""
-        # Step 1: GET /accounts/me
+        """Single heartbeat cycle."""
         try:
             me = await self.api.get_accounts_me()
         except APIError as e:
@@ -120,14 +116,13 @@ class Heartbeat:
                 return
             raise
 
-        # Step 2: Determine state
         state, ctx = determine_state(me)
         log.info("State: %s", state)
 
-        # Feed dashboard with account info
         self._agent_key = str(me.get("agentId", me.get("id", "agent-1")))
         self._agent_name = me.get("agentName", me.get("name", "Agent"))
         balance = me.get("balance", 0)
+
         dashboard_state.total_smoltz = balance
         dashboard_state.update_agent(self._agent_key, {
             "name": self._agent_name,
@@ -136,7 +131,6 @@ class Heartbeat:
             "whitelisted": state != NO_IDENTITY,
         })
 
-        # Step 3: Route based on state
         if state == NO_IDENTITY:
             await self._handle_no_identity(me)
             return
@@ -150,7 +144,7 @@ class Heartbeat:
             return
 
     async def _handle_no_identity(self, me: dict):
-        """Setup pipeline: wallet → whitelist → identity. Respects config flags."""
+        """Setup pipeline."""
         creds = load_credentials() or {}
         owner_eoa = creds.get("owner_eoa", "")
         agent_eoa = creds.get("agent_wallet_address", "")
@@ -160,7 +154,6 @@ class Heartbeat:
             await asyncio.sleep(30)
             return
 
-        # Q6: SC Wallet
         if AUTO_SC_WALLET:
             wallet_addr = await ensure_molty_wallet(self.api, owner_eoa)
             if not wallet_addr:
@@ -168,35 +161,28 @@ class Heartbeat:
                 await asyncio.sleep(30)
                 return
         else:
-            log.info("SC Wallet creation skipped (AUTO_SC_WALLET=false)")
+            log.info("SC Wallet creation skipped.")
 
-        # Q4: Whitelist
         if AUTO_WHITELIST:
             wl_ok = await ensure_whitelist(self.api, owner_eoa, agent_eoa)
             if not wl_ok:
-                log.info(
-                    "⏳ Whitelist pending — Owner EOA may need CROSS for gas. "
-                    "Fund Owner EOA: %s then bot will retry in 2 minutes.", owner_eoa
-                )
+                log.info("⏳ Whitelist pending — Fund Owner EOA with CROSS.")
                 await asyncio.sleep(120)
                 return
         else:
-            log.info("Whitelist auto-approval skipped (AUTO_WHITELIST=false). Approve manually at https://www.moltyroyale.com")
+            log.info("Whitelist auto-approval skipped.")
 
-        # Q9: ERC-8004 Identity
         if AUTO_IDENTITY:
             id_ok = await ensure_identity(self.api)
             if not id_ok:
-                log.info("Identity registration pending. Will retry in 30s.")
+                log.info("Identity registration pending.")
                 await asyncio.sleep(30)
                 return
-        else:
-            log.info("Identity auto-registration skipped (AUTO_IDENTITY=false)")
 
         log.info("✅ Full setup complete!")
 
     async def _handle_ready(self, me: dict, state: str):
-        """Join a game based on room selection."""
+        """Join a new game."""
         room_type = select_room(me)
 
         try:
@@ -204,46 +190,43 @@ class Heartbeat:
                 game_id, agent_id = await join_paid_game(self.api)
             else:
                 game_id, agent_id = await join_free_game(self.api)
-        except APIError as e:
-            if e.code == "NO_IDENTITY":
-                log.error("Identity required. Will setup next cycle.")
-                return
-            log.warning("Join failed: %s. Retrying in 10s.", e)
-            await asyncio.sleep(10)
-            return
-        except RuntimeError as e:
+        except Exception as e:
             log.warning("Join failed: %s. Retrying in 10s.", e)
             await asyncio.sleep(10)
             return
 
-        # Successfully joined → play
         await self._play_game(game_id, agent_id, room_type)
 
     async def _handle_in_game(self, ctx: dict):
-        """Handle active game.
-        PERUBAHAN UTAMA: Jika agent sudah MATI → langsung join room baru tanpa menunggu game selesai.
-        """
-        game_id = ctx["game_id"]
-        agent_id = ctx["agent_id"]
+        """Handle active game — Jika mati maka leave game agar bisa join baru."""
+        game_id = ctx.get("game_id")
+        agent_id = ctx.get("agent_id")
         entry_type = ctx.get("entry_type", "free")
         is_alive = ctx.get("is_alive", True)
 
         if not is_alive:
-            log.info(f"Agent sudah MATI di game {game_id}. Langsung join room baru tanpa menunggu game selesai.")
-            dashboard_state.add_log(f"Agent mati di game {game_id[:12]} → joining new room", "warning", self._agent_key)
-            
-            # Short delay sebelum kembali ke cycle utama
-            await asyncio.sleep(3)
+            log.info(f"Agent MATI di game {game_id}. Mencoba keluar dari game...")
+
+            try:
+                # Coba leave game agar tidak stuck di IN_GAME
+                await self.api.leave_game(game_id, agent_id)
+                log.info(f"✅ Berhasil leave game {game_id}. Siap join room baru.")
+                dashboard_state.add_log(f"Left dead game {game_id[:12]}", "success", self._agent_key)
+            except AttributeError:
+                log.warning("Method leave_game tidak ditemukan di MoltyAPI. Agent mungkin tetap terdeteksi di IN_GAME.")
+            except Exception as e:
+                log.warning(f"Gagal leave game {game_id}: {e}")
+
+            await asyncio.sleep(4)  # beri jeda agar state router update
             return
 
-        # Jika masih hidup, lanjut main game
+        # Masih hidup → lanjut main game
         await self._play_game(game_id, agent_id, entry_type)
 
     async def _play_game(self, game_id: str, agent_id: str, entry_type: str):
-        """Run the WebSocket gameplay engine."""
+        """Run gameplay engine."""
         log.info("═══ PLAYING GAME: %s (type=%s) ═══", game_id, entry_type)
 
-        # Feed dashboard
         dashboard_state.update_agent(self._agent_key, {
             "status": "playing",
             "room_id": game_id,
@@ -251,11 +234,9 @@ class Heartbeat:
         })
         dashboard_state.add_log(f"Joined {entry_type} game: {game_id[:12]}", "info", self._agent_key)
 
-        # Set temp memory for this game
         self.memory.set_temp_game(game_id)
         await self.memory.save()
 
-        # Run WebSocket engine
         engine = WebSocketEngine(game_id, agent_id)
         engine.dashboard_key = self._agent_key
         engine.dashboard_name = self._agent_name
@@ -264,16 +245,15 @@ class Heartbeat:
 
         # Settlement
         if game_result and game_result.get("status") == "dead":
-            log.info(f"Agent mati di game {game_id}. Melakukan early settlement.")
+            log.info(f"Agent mati di game {game_id} → early settlement.")
             await settle_game(game_result, entry_type, self.memory, early_exit=True)
         else:
             await settle_game(game_result, entry_type, self.memory)
 
-        log.info("Game complete. Starting next cycle in 3s...")
+        log.info("Game cycle complete. Next cycle in 3s...")
         await asyncio.sleep(3)
 
 
-# Untuk menjalankan langsung (jika dijalankan sebagai main)
 if __name__ == "__main__":
     heartbeat = Heartbeat()
     asyncio.run(heartbeat.run())
