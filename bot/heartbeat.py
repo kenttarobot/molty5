@@ -20,7 +20,7 @@ from bot.memory.agent_memory import AgentMemory
 from bot.credentials import load_credentials, get_api_key
 from bot.config import (
     ADVANCED_MODE, ROOM_MODE, AUTO_WHITELIST,
-    AUTO_SC_WALLET, ENABLE_MEMORY, AUTO_IDENTITY,
+    AUTO_SC_WALLET, ENABLE_MEMORY, AUTO_IDENTITY, SKILL_VERSION
 )
 from bot.utils.logger import get_logger
 
@@ -36,6 +36,8 @@ class Heartbeat:
         self.running = True
         self._agent_key = "agent-1"  # Consistent dashboard key
         self._agent_name = "Agent"
+        self._version_validated = False
+        self._version_retry_count = 0
 
     async def run(self):
         """Entry point — runs the heartbeat loop indefinitely."""
@@ -45,12 +47,13 @@ class Heartbeat:
 
         # Log active config (answers to setup.md First-Run Intake)
         log.info("Config (First-Run Intake answers):")
-        log.info("  ADVANCED_MODE   = %s  (Q1-3: auto Owner+Agent wallet)", ADVANCED_MODE)
-        log.info("  AUTO_SC_WALLET  = %s  (Q6: auto SC wallet)", AUTO_SC_WALLET)
-        log.info("  AUTO_WHITELIST  = %s  (Q4: auto whitelist)", AUTO_WHITELIST)
-        log.info("  ENABLE_MEMORY   = %s  (Q7: cross-game learning)", ENABLE_MEMORY)
-        log.info("  AUTO_IDENTITY   = %s  (Q9: auto ERC-8004)", AUTO_IDENTITY)
-        log.info("  ROOM_MODE       = %s", ROOM_MODE)
+        log.info("  SKILL_VERSION    = %s", SKILL_VERSION)
+        log.info("  ADVANCED_MODE    = %s  (Q1-3: auto Owner+Agent wallet)", ADVANCED_MODE)
+        log.info("  AUTO_SC_WALLET   = %s  (Q6: auto SC wallet)", AUTO_SC_WALLET)
+        log.info("  AUTO_WHITELIST   = %s  (Q4: auto whitelist)", AUTO_WHITELIST)
+        log.info("  ENABLE_MEMORY    = %s  (Q7: cross-game learning)", ENABLE_MEMORY)
+        log.info("  AUTO_IDENTITY    = %s  (Q9: auto ERC-8004)", AUTO_IDENTITY)
+        log.info("  ROOM_MODE        = %s", ROOM_MODE)
 
         # Phase 0: First-run intake + account setup (retry until success)
         creds = None
@@ -71,6 +74,12 @@ class Heartbeat:
 
         self.api = MoltyAPI(creds.get("api_key", "") or get_api_key())
 
+        # Validate version before proceeding
+        if not await self._validate_version():
+            log.critical("Version validation failed. Agent cannot continue.")
+            log.critical("Please update SKILL_VERSION in config.py and restart.")
+            return
+
         # Feed dashboard
         dashboard_state.bots_running = 1
         dashboard_state.add_log("Bot started", "info")
@@ -89,9 +98,37 @@ class Heartbeat:
             try:
                 await self._heartbeat_cycle()
                 consecutive_errors = 0  # Reset on success
+                self._version_retry_count = 0  # Reset version retry on success
             except KeyboardInterrupt:
                 log.info("Shutdown requested")
                 self.running = False
+            except APIError as e:
+                if e.code == "VERSION_MISMATCH":
+                    self._version_retry_count += 1
+                    if self._version_retry_count >= 3:
+                        log.critical("Version mismatch after %d retries. Stopping agent.", 
+                                   self._version_retry_count)
+                        log.critical("Please update SKILL_VERSION in config.py to: %s", 
+                                   e.expected_version)
+                        self.running = False
+                        return
+                    
+                    log.error("Version mismatch: %s", e.message)
+                    if e.expected_version:
+                        log.info("Server requires version: %s", e.expected_version)
+                        log.info("Current version: %s", SKILL_VERSION)
+                    
+                    # Wait longer for version issues
+                    await asyncio.sleep(60)
+                    continue
+                
+                # Other API errors
+                consecutive_errors += 1
+                wait = min(10 * (2 ** min(consecutive_errors - 1, 4)), 120)
+                log.error("API error (#%d): %s. Retrying in %ds...",
+                          consecutive_errors, e, wait)
+                await asyncio.sleep(wait)
+                
             except Exception as e:
                 consecutive_errors += 1
                 # Escalating backoff: 10s → 30s → 60s → 120s
@@ -104,8 +141,55 @@ class Heartbeat:
             await self.api.close()
         log.info("Agent stopped.")
 
+    async def _validate_version(self) -> bool:
+        """Validate agent version against server requirements."""
+        log.info("Validating agent version...")
+        
+        if not self.api:
+            log.error("API client not initialized")
+            return False
+        
+        try:
+            is_compatible, required_version = await self.api.check_version()
+            
+            if is_compatible:
+                log.info("✅ Version validation passed: %s", SKILL_VERSION)
+                self._version_validated = True
+                return True
+            else:
+                log.error("❌ Version validation failed!")
+                log.error("   Agent version: %s", SKILL_VERSION)
+                log.error("   Required version: %s", required_version)
+                log.error("")
+                log.error("To fix this issue:")
+                log.error("1. Edit bot/config.py")
+                log.error("2. Change SKILL_VERSION = '%s'", required_version or "X.X.X")
+                log.error("3. Restart the agent")
+                return False
+                
+        except APIError as e:
+            if e.code == "VERSION_MISMATCH":
+                log.error("Version mismatch detected: %s", e.message)
+                if e.expected_version:
+                    log.error("Expected version: %s", e.expected_version)
+                    log.error("Current version: %s", SKILL_VERSION)
+                return False
+            else:
+                log.warning("Could not validate version: %s", e)
+                # Assume compatible if version check fails
+                return True
+        except Exception as e:
+            log.warning("Unexpected error during version validation: %s", e)
+            # Assume compatible to continue
+            return True
+
     async def _heartbeat_cycle(self):
         """Single heartbeat cycle: check state → route → act."""
+        if not self._version_validated:
+            log.warning("Version not validated yet. Validating...")
+            if not await self._validate_version():
+                raise APIError("VERSION_MISMATCH", "Version validation failed", 426)
+        
         # Step 1: GET /accounts/me
         try:
             me = await self.api.get_accounts_me()
