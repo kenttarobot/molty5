@@ -2,16 +2,17 @@
 Strategy brain — main decision engine with priority-based action selection.
 Implements the game-loop.md priority chain for high win rate.
 
-v3.0.0 - META CORE WITH 3 MODE BRAIN (RUSH / HUNT / SURVIVE)
+v3.1.0 - EARLY GAME WEAPON PRIORITY + META CORE
 ==============================================================
-META FEATURES:
+FIXES & ENHANCEMENTS:
+- EARLY GAME WEAPON PRIORITY: Jika tidak ada weapon → cari & equip senjata terdekat
+- Prioritaskan pickup weapon di turn pertama
 - 3 MODE OTAK: RUSH (Early) → HUNT (Mid) → SURVIVE (Late)
 - KILL STEAL SYSTEM: Buru musuh HP < 20
 - THREAT MEMORY: Hindari player berbahaya
 - ACTIVE HUNTING: Ngejar musuh low HP
 - EXECUTE MODE: No hesitation kill confirm
 - CHAOS FACTOR: Anti-predict random
-- ECONOMY SNOWBALL: Prioritass smoltz absolute
 """
 
 from bot.utils.logger import get_logger
@@ -39,6 +40,10 @@ RUSH_MAX_ALIVE = 50      # Mode RUSH sampai 50 player tersisa
 HUNT_MAX_ALIVE = 20      # Mode HUNT dari 50-20 player
 # SURVIVE when alive_count < 20
 
+# ── EARLY GAME WEAPON PRIORITY (v3.1.0) ───────────────────────────────
+EARLY_GAME_TURNS = 50    # 50 turn pertama dianggap early game
+WEAPON_PICKUP_PRIORITY_BOOST = 500  # Boost score untuk weapon di early game
+
 # ── Weapon stats ──────────────────────────────────────────────────────
 WEAPONS = {
     "fist": {"bonus": 0, "range": 0, "value": 0, "priority": 0},
@@ -52,7 +57,7 @@ WEAPONS = {
 
 WEAPON_PRIORITY = ["katana", "sniper", "sword", "pistol", "dagger", "bow", "fist"]
 
-# ── Item priority for pickup ──────────────────────────────────────────
+# ── Item priority for pickup (v3.1.0 - boosted weapon priority) ───────
 ITEM_PRIORITY = {
     "rewards": 1000,       # SMOLTZ - ABSOLUTE HIGHEST!
     "katana": 900,
@@ -115,6 +120,24 @@ def get_weapon_range(equipped_weapon) -> int:
     return WEAPONS.get(type_id, {}).get("range", 0)
 
 
+def has_weapon_equipped(equipped) -> bool:
+    """Check if bot has any weapon equipped (not fist)."""
+    if not equipped:
+        return False
+    type_id = equipped.get("typeId", "").lower()
+    return type_id != "fist" and type_id in WEAPONS and WEAPONS.get(type_id, {}).get("bonus", 0) > 0
+
+
+def has_any_weapon_in_inventory(inventory: list) -> bool:
+    """Check if inventory contains any weapon."""
+    for item in inventory:
+        if not isinstance(item, dict):
+            continue
+        if item.get("category") == "weapon":
+            return True
+    return False
+
+
 # Global state
 _known_agents: dict = {}
 _known_guardians: dict = {}
@@ -122,6 +145,7 @@ _total_smoltz_collected: int = 0
 _farming_stats: dict = {}
 _map_knowledge: dict = {"revealed": False, "death_zones": set(), "safe_center": []}
 _current_mode: str = "RUSH"
+_turn_counter: int = 0
 
 
 def _resolve_region(entry, view: dict):
@@ -143,10 +167,11 @@ def _get_region_id(entry) -> str:
 
 
 def reset_game_state():
-    global _known_agents, _known_guardians, _total_smoltz_collected, _farming_stats, _map_knowledge, _current_mode
+    global _known_agents, _known_guardians, _total_smoltz_collected, _farming_stats, _map_knowledge, _current_mode, _turn_counter
     _known_agents = {}
     _known_guardians = {}
     _total_smoltz_collected = 0
+    _turn_counter = 0
     _farming_stats = {
         "guardians_killed": 0,
         "players_killed": 0,
@@ -157,8 +182,9 @@ def reset_game_state():
     _map_knowledge = {"revealed": False, "death_zones": set(), "safe_center": []}
     _current_mode = "RUSH"
     log.info("=" * 60)
-    log.info("🤖 META CORE v3.0.0 - 3 MODE BRAIN ACTIVATED")
+    log.info("🤖 META CORE v3.1.0 - EARLY GAME WEAPON PRIORITY")
     log.info("   RUSH (Early) → HUNT (Mid) → SURVIVE (Late)")
+    log.info("   + Early game: cari & equip senjata terdekat!")
     log.info("=" * 60)
 
 
@@ -198,19 +224,14 @@ def learn_from_map(view: dict):
 # =========================
 
 def _get_mode(alive_count: int) -> tuple[str, dict]:
-    """Determine bot mode based on remaining players.
-    
-    Returns:
-        mode: "RUSH", "HUNT", or "SURVIVE"
-        thresholds: EP thresholds for this mode
-    """
+    """Determine bot mode based on remaining players."""
     global _current_mode
     
     if alive_count >= RUSH_MAX_ALIVE:
         mode = "RUSH"
         thresholds = {
-            "EP_SAFE": 0.40,      # Lebih agresif, EP bisa lebih rendah
-            "EP_COMBAT": 0.15,    # Minimal 15% EP untuk fight
+            "EP_SAFE": 0.40,
+            "EP_COMBAT": 0.15,
             "description": "🔥 AGGRESSIVE - Kill everything!"
         }
     elif alive_count >= HUNT_MAX_ALIVE:
@@ -223,8 +244,8 @@ def _get_mode(alive_count: int) -> tuple[str, dict]:
     else:
         mode = "SURVIVE"
         thresholds = {
-            "EP_SAFE": 0.70,      # Jaga EP tinggi
-            "EP_COMBAT": 0.50,    # Minimal 50% EP untuk fight
+            "EP_SAFE": 0.70,
+            "EP_COMBAT": 0.50,
             "description": "🧬 SURVIVAL - Only sure wins"
         }
     
@@ -259,7 +280,6 @@ def _select_best_kill_target(targets: list, my_atk: int, weapon_bonus: int) -> d
     if not alive_targets:
         return None
     
-    # Prioritize lowest HP for quick kills
     return min(alive_targets, key=lambda t: t.get("hp", 999))
 
 
@@ -307,8 +327,67 @@ def _select_weakest_monster(monsters: list) -> dict | None:
 
 
 # =========================
-# 🧠 SMOLTZ & ITEM MANAGEMENT
+# 🧠 EARLY GAME WEAPON PRIORITY (v3.1.0)
 # =========================
+
+def _is_early_game() -> bool:
+    """Check if still in early game phase."""
+    global _turn_counter
+    return _turn_counter < EARLY_GAME_TURNS
+
+
+def _has_no_weapon(equipped, inventory: list) -> bool:
+    """Check if bot has NO weapon at all (fist only)."""
+    has_weapon_equip = has_weapon_equipped(equipped)
+    has_weapon_inv = has_any_weapon_in_inventory(inventory)
+    return not has_weapon_equip and not has_weapon_inv
+
+
+def _pickup_weapon_priority(items: list, inventory: list, region_id: str, is_early: bool, has_weapon: bool) -> dict | None:
+    """
+    PICKUP WEAPON dengan prioritas tinggi di early game.
+    v3.1.0: Jika tidak ada weapon, cari dan equip senjata terdekat.
+    """
+    local_items = [i for i in items
+                   if isinstance(i, dict) and i.get("regionId") == region_id]
+    if not local_items:
+        local_items = [i for i in items if isinstance(i, dict) and i.get("id")]
+    if not local_items:
+        return None
+    
+    # Filter weapon items
+    weapon_items = [i for i in local_items if i.get("category") == "weapon"]
+    
+    if not weapon_items:
+        return None
+    
+    # EARLY GAME: Jika belum punya weapon, ambil weapon APAPUN!
+    if is_early and not has_weapon:
+        # Urutkan weapon dari yang terbaik ke terburuk
+        weapon_items.sort(key=lambda i: WEAPONS.get(i.get("typeId", "").lower(), {}).get("priority", 0), reverse=True)
+        best_weapon = weapon_items[0]
+        w_type = best_weapon.get("typeId", "unknown")
+        log.info("🏹🏹🏹 EARLY GAME: NO WEAPON! Pickup %s IMMEDIATELY!", w_type)
+        return {"action": "pickup", "data": {"itemId": best_weapon["id"]},
+                "reason": f"EARLY WEAPON: {w_type} - NO WEAPON!"}
+    
+    # Early game: Boost priority untuk weapon (ambil weapon bagus)
+    if is_early:
+        weapon_items.sort(key=lambda i: WEAPONS.get(i.get("typeId", "").lower(), {}).get("priority", 0), reverse=True)
+        best_weapon = weapon_items[0]
+        w_type = best_weapon.get("typeId", "unknown")
+        w_priority = WEAPONS.get(w_type, {}).get("priority", 0)
+        
+        # Cek weapon yang sudah dimiliki
+        current_priority = get_weapon_priority(inventory) if inventory else 0
+        
+        if w_priority > current_priority:
+            log.info("🏹 EARLY GAME: Better weapon found! %s (priority %d)", w_type, w_priority)
+            return {"action": "pickup", "data": {"itemId": best_weapon["id"]},
+                    "reason": f"EARLY WEAPON UPGRADE: {w_type}"}
+    
+    return None
+
 
 def _pickup_smoltz_absolute(items: list, inventory: list, region_id: str) -> dict | None:
     """PICKUP SMOLTZ FIRST - Absolute priority!"""
@@ -331,16 +410,6 @@ def _pickup_smoltz_absolute(items: list, inventory: list, region_id: str) -> dic
         log.info("💰💰💰 SMOLTZ ABSOLUTE PICKUP! +%d sMoltz", amount)
         return {"action": "pickup", "data": {"itemId": best_currency["id"]},
                 "reason": f"💰 SMOLTZ ABSOLUTE: +{amount}!"}
-    
-    # Then weapons
-    weapon_items = [i for i in local_items if i.get("category") == "weapon"]
-    if weapon_items:
-        weapon_items.sort(key=lambda i: WEAPONS.get(i.get("typeId", "").lower(), {}).get("priority", 0), reverse=True)
-        best = weapon_items[0]
-        w_type = best.get("typeId", "unknown")
-        log.info("⚔️ WEAPON PICKUP: %s", w_type)
-        return {"action": "pickup", "data": {"itemId": best["id"]},
-                "reason": f"WEAPON: {w_type}"}
     
     return None
 
@@ -459,7 +528,6 @@ def _find_safe_region(connections, danger_ids: set, view: dict = None) -> str | 
         if isinstance(conn, dict):
             terrain = conn.get("terrain", "").lower()
             weather = conn.get("weather", "").lower()
-            # Hindari water dan storm untuk positioning
             if terrain == "water" or weather == "storm":
                 continue
         return rid
@@ -471,7 +539,6 @@ def _find_low_hp_enemy_region(enemies: list, current_region_id: str) -> str | No
     if not enemies:
         return None
     
-    # Cari musuh dengan HP terendah
     low_hp_enemies = [e for e in enemies if e.get("hp", 100) < 40]
     if low_hp_enemies:
         target = min(low_hp_enemies, key=lambda e: e.get("hp", 999))
@@ -501,25 +568,29 @@ def _track_smoltz_gain(view: dict, my_id: str):
 
 
 # =========================
-# 🧠 MAIN DECISION FUNCTION (v3.0.0 META CORE)
+# 🧠 MAIN DECISION FUNCTION (v3.1.0 - EARLY GAME WEAPON PRIORITY)
 # =========================
 
 def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict | None:
     """
-    Main decision engine - META CORE v3.0.0 with 3 MODE BRAIN
+    Main decision engine - META CORE v3.1.0
     
     PRIORITY CHAIN:
     1. DEATHZONE ESCAPE
-    2. SMOLTZ PICKUP (ABSOLUTE)
-    3. CLAIM SMOLTZ FROM INVENTORY
-    4. EQUIP BEST WEAPON
-    5. KILL STEAL (HP < 20) - OVERPOWERED!
-    6. MODE-BASED COMBAT (RUSH/HUNT/SURVIVE)
-    7. GUARDIAN FARMING (120 sMoltz)
-    8. MONSTER FARMING
-    9. HP/EP MAINTENANCE
-    10. MOVEMENT & HUNTING
+    2. EARLY GAME WEAPON PICKUP (jika belum punya weapon!) - NEW!
+    3. SMOLTZ PICKUP (ABSOLUTE)
+    4. CLAIM SMOLTZ FROM INVENTORY
+    5. EQUIP BEST WEAPON
+    6. KILL STEAL (HP < 20) - OVERPOWERED!
+    7. MODE-BASED COMBAT (RUSH/HUNT/SURVIVE)
+    8. GUARDIAN FARMING
+    9. MONSTER FARMING
+    10. HP/EP MAINTENANCE
+    11. MOVEMENT & HUNTING
     """
+    global _turn_counter
+    _turn_counter += 1
+    
     self_data = view.get("self", {})
     region = view.get("currentRegion", {})
     hp = self_data.get("hp", 100)
@@ -572,6 +643,10 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     EP_SAFE_THRESHOLD = mode_thresholds["EP_SAFE"]
     EP_COMBAT_MIN = mode_thresholds["EP_COMBAT"]
     
+    # Early game detection
+    is_early = _is_early_game()
+    has_no_weapon_flag = _has_no_weapon(equipped, inventory)
+    
     # Build danger map
     danger_ids = set()
     for dz in pending_dz:
@@ -595,8 +670,9 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     
     in_deathzone = region.get("isDeathZone", False) or region_id in danger_ids
     
-    log.debug("📊 [%s] HP=%d EP=%d/%d(%.0f%%) ATK=%d ALIVE=%d", 
-              mode, hp, ep, max_ep, ep_ratio*100, total_atk, alive_count)
+    log.debug("📊 [%s][TURN:%d] HP=%d EP=%d/%d(%.0f%%) ATK=%d WEAPON=%s", 
+              mode, _turn_counter, hp, ep, max_ep, ep_ratio*100, total_atk,
+              equipped.get("typeId", "fist") if equipped else "fist")
     
     # ═══════════════════════════════════════════════════════════════════
     # PRIORITY 1: DEATHZONE ESCAPE (override everything)
@@ -609,21 +685,30 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "reason": f"DEATHZONE ESCAPE"}
     
     # ═══════════════════════════════════════════════════════════════════
-    # PRIORITY 2: SMOLTZ PICKUP (ABSOLUTE)
+    # PRIORITY 2: EARLY GAME WEAPON PICKUP (v3.1.0 - PALING PENTING!)
+    # Jika belum punya weapon, cari dan ambil senjata APAPUN di early game!
+    # ═══════════════════════════════════════════════════════════════════
+    if is_early:
+        weapon_pickup_action = _pickup_weapon_priority(visible_items, inventory, region_id, is_early, not has_no_weapon_flag)
+        if weapon_pickup_action:
+            return weapon_pickup_action
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # PRIORITY 3: SMOLTZ PICKUP (ABSOLUTE)
     # ═══════════════════════════════════════════════════════════════════
     pickup_action = _pickup_smoltz_absolute(visible_items, inventory, region_id)
     if pickup_action:
         return pickup_action
     
     # ═══════════════════════════════════════════════════════════════════
-    # PRIORITY 3: CLAIM SMOLTZ FROM INVENTORY
+    # PRIORITY 4: CLAIM SMOLTZ FROM INVENTORY
     # ═══════════════════════════════════════════════════════════════════
     claim_action = _claim_smoltz_from_inventory(inventory)
     if claim_action:
         return claim_action
     
     # ═══════════════════════════════════════════════════════════════════
-    # PRIORITY 4: EQUIP BEST WEAPON
+    # PRIORITY 5: EQUIP BEST WEAPON (jika ada weapon di inventory)
     # ═══════════════════════════════════════════════════════════════════
     equip_action = _check_equip_best_weapon(inventory, equipped)
     if equip_action:
@@ -633,7 +718,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         return None
     
     # ═══════════════════════════════════════════════════════════════════
-    # PRIORITY 5: KILL STEAL (HP < 20) - OVERPOWERED!
+    # PRIORITY 6: KILL STEAL (HP < 20) - OVERPOWERED!
     # ═══════════════════════════════════════════════════════════════════
     all_enemies = [a for a in visible_agents
                    if a.get("isAlive", True)
@@ -649,17 +734,15 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                         "reason": "🔥 KILL STEAL: HP<20!"}
     
     # ═══════════════════════════════════════════════════════════════════
-    # PRIORITY 6: MODE-BASED COMBAT
+    # PRIORITY 7: MODE-BASED COMBAT
     # ═══════════════════════════════════════════════════════════════════
     
-    # Cek apakah bisa fight (EP cukup)
     can_fight = ep_ratio >= EP_COMBAT_MIN and hp >= FARMING_HP_MIN
     
     # ── DANGEROUS ENEMY AVOIDANCE (except RUSH mode) ───────────────────
     if mode != "RUSH":
         dangerous_enemies = [e for e in all_enemies if _is_dangerous(e) and e.get("regionId") == region_id]
         if dangerous_enemies and can_fight:
-            # Cek outcome dulu
             for dangerous in dangerous_enemies[:3]:
                 outcome = estimate_combat_outcome(
                     hp, atk, defense, current_atk_bonus,
@@ -667,7 +750,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     _estimate_enemy_weapon_bonus(dangerous), region_weather
                 )
                 if not outcome["win"]:
-                    # Flee from dangerous enemy
                     safe = _find_safe_region(connections, danger_ids, view)
                     if safe:
                         log.warning("⚠️ [%s] Fleeing from dangerous enemy!", mode)
@@ -676,14 +758,12 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     
     # ── MODE RUSH: AGGRESSIVE - attack almost everything ───────────────
     if mode == "RUSH":
-        # RUSH: attack any enemy in range
         if all_enemies and can_fight:
             target = _select_best_kill_target(all_enemies, total_atk, 0)
             if target:
                 w_range = get_weapon_range(equipped)
                 if _is_in_range(target, region_id, w_range, connections):
                     enemy_hp = target.get("hp", 100)
-                    # EXECUTE MODE: if HP <= my damage, ALWAYS ATTACK
                     my_damage = max(1, total_atk - int(target.get("def", 5) * 0.5))
                     if enemy_hp <= my_damage or enemy_hp < 50:
                         log.info("🔥 [RUSH] ATTACK! Enemy HP=%d", enemy_hp)
@@ -691,7 +771,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                                 "data": {"targetId": target["id"], "targetType": "agent"},
                                 "reason": f"🔥 RUSH: HP={enemy_hp}"}
         
-        # RUSH: guardians are MUST KILL
         guardians = [a for a in visible_agents if a.get("isGuardian", False) and a.get("isAlive", True)]
         if guardians and can_fight:
             target = _select_weakest_target(guardians)
@@ -705,7 +784,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     
     # ── MODE HUNT: SMART KILLING - only easy kills ─────────────────────
     elif mode == "HUNT":
-        # HUNT: only attack easy kills (1-2 hits)
         if all_enemies and can_fight:
             easy_targets = [e for e in all_enemies 
                            if _is_easy_kill(e, total_atk, 0)
@@ -722,7 +800,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                                 "data": {"targetId": target["id"], "targetType": "agent"},
                                 "reason": f"🐺 HUNT: Easy kill HP={enemy_hp}"}
         
-        # HUNT: guardians still priority
         guardians = [a for a in visible_agents if a.get("isGuardian", False) and a.get("isAlive", True)]
         if guardians and can_fight:
             target = _select_weakest_target(guardians)
@@ -736,7 +813,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     
     # ── MODE SURVIVE: ONLY SURE WINS ───────────────────────────────────
     elif mode == "SURVIVE":
-        # SURVIVE: only fight if guaranteed win
         if all_enemies and can_fight and hp >= 50:
             for enemy in all_enemies:
                 if enemy.get("regionId") != region_id:
@@ -754,7 +830,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                                 "data": {"targetId": enemy["id"], "targetType": "agent"},
                                 "reason": f"🧬 SURVIVE: Sure win"}
         
-        # SURVIVE: if no sure win and enemies nearby, FLEE
         enemies_nearby = [e for e in all_enemies if e.get("regionId") == region_id]
         if enemies_nearby:
             safe = _find_safe_region(connections, danger_ids, view)
@@ -764,7 +839,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                         "reason": "SURVIVE: Fleeing to safety"}
     
     # ═══════════════════════════════════════════════════════════════════
-    # PRIORITY 7: GUARDIAN FARMING (if not handled by mode)
+    # PRIORITY 8: GUARDIAN FARMING
     # ═══════════════════════════════════════════════════════════════════
     guardians = [a for a in visible_agents if a.get("isGuardian", False) and a.get("isAlive", True)]
     if guardians and can_fight and hp >= 30:
@@ -778,7 +853,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                         "reason": "💰 GUARDIAN: 120 sMoltz!"}
     
     # ═══════════════════════════════════════════════════════════════════
-    # PRIORITY 8: MONSTER FARMING
+    # PRIORITY 9: MONSTER FARMING
     # ═══════════════════════════════════════════════════════════════════
     monsters = [m for m in visible_monsters if m.get("hp", 0) > 0]
     if monsters and can_fight and hp > 20:
@@ -791,10 +866,9 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                         "reason": f"MONSTER: HP={target.get('hp', '?')}"}
     
     # ═══════════════════════════════════════════════════════════════════
-    # PRIORITY 9: HP & EP MAINTENANCE
+    # PRIORITY 10: HP & EP MAINTENANCE
     # ═══════════════════════════════════════════════════════════════════
     
-    # HP Management
     if hp < 30:
         heal = _find_healing_item(inventory, critical=True)
         if heal:
@@ -806,7 +880,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             return {"action": "use_item", "data": {"itemId": heal["id"]},
                     "reason": f"HEAL: HP={hp}"}
     
-    # EP Management (mode-based thresholds)
     if ep_ratio < EP_SAFE_THRESHOLD:
         energy_drink = _find_energy_drink(inventory)
         if energy_drink:
@@ -818,10 +891,9 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "reason": f"REST: EP={ep}/{max_ep}"}
     
     # ═══════════════════════════════════════════════════════════════════
-    # PRIORITY 10: MOVEMENT & ACTIVE HUNTING
+    # PRIORITY 11: MOVEMENT & ACTIVE HUNTING
     # ═══════════════════════════════════════════════════════════════════
     if ep >= move_ep_cost and connections:
-        # ACTIVE HUNTING: ngejar musuh low HP
         if mode in ["RUSH", "HUNT"]:
             hunt_region = _find_low_hp_enemy_region(all_enemies, region_id)
             if hunt_region and hunt_region not in danger_ids:
@@ -829,17 +901,15 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                 return {"action": "move", "data": {"regionId": hunt_region},
                         "reason": "HUNT: Chasing low HP enemy!"}
         
-        # Move to safe region
         move_target = _find_safe_region(connections, danger_ids, view)
         if move_target:
             return {"action": "move", "data": {"regionId": move_target},
                     "reason": f"MOVE: {mode} strategy"}
     
     # ═══════════════════════════════════════════════════════════════════
-    # CHAOS FACTOR (10% chance to do random action - anti-predict)
+    # CHAOS FACTOR (10% chance - anti-predict)
     # ═══════════════════════════════════════════════════════════════════
     if random.random() < 0.1 and mode == "RUSH":
-        # Kadang attack target kedua untuk unpredictability
         if len(all_enemies) >= 2:
             targets_in_range = [e for e in all_enemies 
                                if _is_in_range(e, region_id, get_weapon_range(equipped), connections)]
@@ -855,43 +925,33 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
 """
 ================================================================================
-v3.0.0 - META CORE WITH 3 MODE BRAIN
+v3.1.0 - EARLY GAME WEAPON PRIORITY + META CORE
 ================================================================================
+
+FIXES (v3.1.0):
+---------------
+1. EARLY GAME WEAPON PRIORITY:
+   - Jika belum punya weapon di early game (50 turn pertama)
+   - Langsung cari dan pickup senjata APAPUN
+   - Prioritaskan weapon upgrade di early game
+
+2. _has_no_weapon() - Cek apakah bot belum punya senjata
+3. _pickup_weapon_priority() - Pickup weapon dengan prioritas tinggi
+4. _is_early_game() - Deteksi early game phase
 
 3 MODE OTAK:
 ------------
-1. RUSH (Early Game - alive_count >= 50)
-   - EP_COMBAT_MIN = 15%, EP_SAFE = 40%
-   - Attack almost everything
-   - No fear, kill as many as possible
-   - Guardians must kill
-   - Snowball sMoltz fast
-
-2. HUNT (Mid Game - 20 <= alive_count < 50)
-   - EP_COMBAT_MIN = 30%, EP_SAFE = 50%
-   - Only attack easy kills (1-2 hits)
-   - Smart killing, efficient
-   - Active hunting for low HP enemies
-
-3. SURVIVE (Late Game - alive_count < 20)
-   - EP_COMBAT_MIN = 50%, EP_SAFE = 70%
-   - Only fight if sure win
-   - Flee from dangerous enemies
-   - Focus on survival & winning
+- RUSH (alive >= 50): Barbar, kill semua
+- HUNT (20-49): Cerdas, bunuh yang pasti mati
+- SURVIVE (< 20): Selecktif, fight hanya jika pasti menang
 
 META FEATURES:
 --------------
-- KILL STEAL: Always finish enemies with HP < 20
+- KILL STEAL: Finish HP < 20
 - EXECUTE MODE: Attack if enemy HP <= my damage
-- THREAT MEMORY: Avoid dangerous enemies (high ATK)
-- ACTIVE HUNTING: Move to low HP enemy regions
-- CHAOS FACTOR: 10% random actions (anti-predict)
-- ECONOMY SNOWBALL: Absolute sMoltz priority
-
-EXPORTED FUNCTIONS:
-------------------
-- decide_action() - Main decision engine
-- reset_game_state() - Reset per-game tracking
-- learn_from_map() - Learn map layout
+- THREAT MEMORY: Hindari musuh berbahaya
+- ACTIVE HUNTING: Ngejar musuh low HP
+- CHAOS FACTOR: 10% random action
+- ECONOMY SNOWBALL: sMoltz absolute priority
 ================================================================================
 """
