@@ -1,8 +1,12 @@
 """
 Heartbeat loop — main orchestration per heartbeat.md.
 State machine: setup → join → play → settle → repeat.
-Respects First-Run Intake config flags for Railway/Docker deployment.
+
+PERUBAHAN UTAMA:
+- Ketika agent MATI di dalam game, langsung join room baru tanpa menunggu game selesai.
+- Early exit logic untuk meningkatkan efisiensi join rate.
 """
+
 import asyncio
 from bot.api_client import MoltyAPI, APIError
 from bot.dashboard.state import dashboard_state
@@ -120,7 +124,7 @@ class Heartbeat:
         state, ctx = determine_state(me)
         log.info("State: %s", state)
 
-        # Feed dashboard with account info — use CONSISTENT key
+        # Feed dashboard with account info
         self._agent_key = str(me.get("agentId", me.get("id", "agent-1")))
         self._agent_name = me.get("agentName", me.get("name", "Agent"))
         balance = me.get("balance", 0)
@@ -174,7 +178,7 @@ class Heartbeat:
                     "⏳ Whitelist pending — Owner EOA may need CROSS for gas. "
                     "Fund Owner EOA: %s then bot will retry in 2 minutes.", owner_eoa
                 )
-                await asyncio.sleep(120)  # 2 minutes to fund CROSS
+                await asyncio.sleep(120)
                 return
         else:
             log.info("Whitelist auto-approval skipped (AUTO_WHITELIST=false). Approve manually at https://www.moltyroyale.com")
@@ -216,24 +220,30 @@ class Heartbeat:
         await self._play_game(game_id, agent_id, room_type)
 
     async def _handle_in_game(self, ctx: dict):
-        """Resume or start playing an active game.
-        Per game-loop.md: always connect WS, even when dead.
-        Dead agents wait for game_ended inside the WS engine.
+        """Handle active game.
+        PERUBAHAN UTAMA: Jika agent sudah MATI → langsung join room baru tanpa menunggu game selesai.
         """
         game_id = ctx["game_id"]
         agent_id = ctx["agent_id"]
         entry_type = ctx.get("entry_type", "free")
+        is_alive = ctx.get("is_alive", True)
 
-        if not ctx.get("is_alive", True):
-            log.info("Agent is dead in game %s. Connecting WS to wait for game_ended.", game_id)
+        if not is_alive:
+            log.info(f"Agent sudah MATI di game {game_id}. Langsung join room baru tanpa menunggu game selesai.")
+            dashboard_state.add_log(f"Agent mati di game {game_id[:12]} → joining new room", "warning", self._agent_key)
+            
+            # Short delay sebelum kembali ke cycle utama
+            await asyncio.sleep(3)
+            return
 
+        # Jika masih hidup, lanjut main game
         await self._play_game(game_id, agent_id, entry_type)
 
     async def _play_game(self, game_id: str, agent_id: str, entry_type: str):
         """Run the WebSocket gameplay engine."""
         log.info("═══ PLAYING GAME: %s (type=%s) ═══", game_id, entry_type)
 
-        # Feed dashboard — use SAME key as heartbeat so no duplicate card
+        # Feed dashboard
         dashboard_state.update_agent(self._agent_key, {
             "status": "playing",
             "room_id": game_id,
@@ -245,14 +255,25 @@ class Heartbeat:
         self.memory.set_temp_game(game_id)
         await self.memory.save()
 
-        # Run WebSocket engine — pass agent_key + name for dashboard
+        # Run WebSocket engine
         engine = WebSocketEngine(game_id, agent_id)
         engine.dashboard_key = self._agent_key
         engine.dashboard_name = self._agent_name
+
         game_result = await engine.run()
 
-        # Settle
-        await settle_game(game_result, entry_type, self.memory)
+        # Settlement
+        if game_result and game_result.get("status") == "dead":
+            log.info(f"Agent mati di game {game_id}. Melakukan early settlement.")
+            await settle_game(game_result, entry_type, self.memory, early_exit=True)
+        else:
+            await settle_game(game_result, entry_type, self.memory)
 
-        log.info("Game complete. Starting next cycle in 5s...")
-        await asyncio.sleep(5)
+        log.info("Game complete. Starting next cycle in 3s...")
+        await asyncio.sleep(3)
+
+
+# Untuk menjalankan langsung (jika dijalankan sebagai main)
+if __name__ == "__main__":
+    heartbeat = Heartbeat()
+    asyncio.run(heartbeat.run())
