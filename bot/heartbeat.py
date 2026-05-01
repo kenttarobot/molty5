@@ -1,8 +1,8 @@
 """
-Heartbeat loop — main orchestration.
-VERSI AGRESIF v3.3 - Fast Rejoin after Death
-- Langsung force keluar dari IN_GAME jika agent mati
-- Refresh state lebih sering
+Heartbeat loop v3.4 - Very Aggressive Rejoin
+- Mencoba force leave game jika agent mati
+- Refresh state sangat sering
+- Langsung push ke READY state
 """
 
 import asyncio
@@ -38,28 +38,21 @@ class Heartbeat:
         self._agent_key = "agent-1"
         self._agent_name = "Agent"
         self._dead_skip_count = 0
+        self._last_leave_attempt = 0
 
     async def run(self):
         log.info("═══════════════════════════════════════════")
-        log.info("  MOLTY ROYALE AI AGENT — STARTING (Fast Rejoin v3.3)")
+        log.info("  MOLTY ROYALE AI AGENT — STARTING (Aggressive v3.4)")
         log.info("═══════════════════════════════════════════")
 
         log.info("Config:")
-        log.info("  ADVANCED_MODE   = %s", ADVANCED_MODE)
-        log.info("  AUTO_SC_WALLET  = %s", AUTO_SC_WALLET)
-        log.info("  AUTO_WHITELIST  = %s", AUTO_WHITELIST)
-        log.info("  ENABLE_MEMORY   = %s", ENABLE_MEMORY)
-        log.info("  AUTO_IDENTITY   = %s", AUTO_IDENTITY)
         log.info("  ROOM_MODE       = %s", ROOM_MODE)
+        log.info("  ENABLE_MEMORY   = %s", ENABLE_MEMORY)
 
         creds = None
         while self.running and not creds:
             try:
                 creds = await ensure_account_ready()
-                api_key = creds.get("api_key", "") or get_api_key()
-                if not api_key:
-                    await asyncio.sleep(60)
-                    continue
             except Exception as e:
                 log.error("Setup error: %s", e)
                 await asyncio.sleep(60)
@@ -67,12 +60,12 @@ class Heartbeat:
         self.api = MoltyAPI(creds.get("api_key", "") or get_api_key())
 
         dashboard_state.bots_running = 1
-        dashboard_state.add_log("Bot started - Aggressive Fast Rejoin", "info")
+        dashboard_state.add_log("Bot started - Very Aggressive Rejoin v3.4", "info")
 
         if ENABLE_MEMORY:
             await self.memory.load()
 
-        log.info("Molty Royale AI Agent v2.1.3 - Aggressive Dead Rejoin Mode")
+        log.info("Molty Royale AI Agent v2.1.4 - Very Aggressive Dead Rejoin")
 
         while self.running:
             try:
@@ -81,10 +74,7 @@ class Heartbeat:
                 self.running = False
             except Exception as e:
                 log.error("Heartbeat error: %s", e)
-                await asyncio.sleep(10)
-
-        if self.api:
-            await self.api.close()
+                await asyncio.sleep(8)
 
     async def _heartbeat_cycle(self):
         try:
@@ -103,54 +93,67 @@ class Heartbeat:
         log.info(f"State: {state} | Game: {game_id[:12] if game_id else 'None'} | Alive: {is_alive}")
 
         self._agent_key = str(me.get("agentId", me.get("id", "agent-1")))
-        self._agent_name = me.get("agentName", me.get("name", "Agent"))
 
-        dashboard_state.update_agent(self._agent_key, {
-            "name": self._agent_name,
-            "status": "playing" if state == IN_GAME else "idle",
-        })
-
-        if state == NO_IDENTITY:
-            await self._handle_no_identity(me)
+        if state == IN_GAME and not is_alive:
+            await self._force_leave_and_skip(game_id, ctx.get("agent_id"))
             return
 
         if state == IN_GAME:
-            if not is_alive:
-                await self._handle_dead_skip()
-                return
-            else:
-                # Masih hidup → main
-                await self._play_game(game_id, ctx.get("agent_id"), ctx.get("entry_type", "free"))
-                return
+            await self._play_game(game_id, ctx.get("agent_id"), ctx.get("entry_type", "free"))
+            return
 
-        # State READY
         if state in (READY_FREE, READY_PAID):
             await self._handle_ready(me, state)
             return
 
-        await asyncio.sleep(4)
+        if state == NO_IDENTITY:
+            await self._handle_no_identity()
+            return
 
-    async def _handle_dead_skip(self):
-        """Agresif skip ketika agent mati"""
-        self._dead_skip_count += 1
-        if self._dead_skip_count % 3 == 1:   # kurangi spam log
-            log.warning("Agent MATI → Aggressive skip mode. Akan coba join room baru secepatnya.")
-            dashboard_state.add_log("Dead → Fast rejoin mode", "warning", self._agent_key)
-
-        # Refresh state lebih sering
         await asyncio.sleep(5)
 
-        # Force refresh
+    async def _force_leave_and_skip(self, game_id: str, agent_id: str):
+        """Force leave game jika agent mati"""
+        current_time = time.time()
+        if current_time - self._last_leave_attempt < 15:
+            await asyncio.sleep(6)
+            return
+
+        self._last_leave_attempt = current_time
+        self._dead_skip_count += 1
+
+        log.warning(f"Agent MATI di game {game_id[:12]}. Mencoba FORCE LEAVE...")
+
         try:
-            me = await self.api.get_accounts_me()
-            state, ctx = determine_state(me)
-            log.info(f"Force refresh state: {state}")
-        except:
-            pass
+            # Coba panggil leave_game jika method ada
+            if hasattr(self.api, 'leave_game'):
+                await self.api.leave_game(game_id, agent_id)
+                log.info("✅ leave_game() berhasil dipanggil")
+            else:
+                # Coba panggil langsung via post jika ada endpoint
+                await self.api.post(f"/games/{game_id}/leave", {"agent_id": agent_id})
+                log.info("✅ Force leave via direct endpoint")
+        except Exception as e:
+            log.warning(f"Leave game gagal (normal): {e}")
+
+        dashboard_state.add_log(f"Force leave game {game_id[:12]}", "warning", self._agent_key)
+
+        # Refresh state beberapa kali
+        for _ in range(2):
+            await asyncio.sleep(4)
+            try:
+                me = await self.api.get_accounts_me()
+                state, _ = determine_state(me)
+                log.info(f"State after force leave: {state}")
+                if state in (READY_FREE, READY_PAID):
+                    log.info("✅ Berhasil keluar! State sudah READY")
+                    break
+            except:
+                pass
 
     async def _handle_ready(self, me: dict, state: str):
         room_type = select_room(me)
-        log.info(f"→ JOINING {room_type.upper()} ROOM...")
+        log.info(f"→ JOINING {room_type.upper()} ROOM NOW...")
 
         try:
             if room_type == "paid":
@@ -158,19 +161,17 @@ class Heartbeat:
             else:
                 game_id, agent_id = await join_free_game(self.api)
 
-            log.info(f"✅ Berhasil join {room_type} game: {game_id}")
+            log.info(f"✅ BERHASIL JOIN {room_type} GAME: {game_id}")
             await self._play_game(game_id, agent_id, room_type)
         except Exception as e:
             log.warning(f"Join gagal: {e}")
-            await asyncio.sleep(8)
+            await asyncio.sleep(10)
 
     async def _play_game(self, game_id: str, agent_id: str, entry_type: str):
-        log.info(f"═══ PLAYING {game_id[:12]} ({entry_type}) ═══")
+        log.info(f"═══ PLAYING GAME {game_id[:12]} ═══")
+        # ... (kode play_game tetap sama seperti sebelumnya)
 
-        dashboard_state.update_agent(self._agent_key, {
-            "status": "playing",
-            "room_id": game_id,
-        })
+        dashboard_state.update_agent(self._agent_key, {"status": "playing", "room_id": game_id})
 
         self.memory.set_temp_game(game_id)
         await self.memory.save()
@@ -187,6 +188,19 @@ class Heartbeat:
             await settle_game(game_result, entry_type, self.memory)
 
         await asyncio.sleep(3)
+
+    async def _handle_no_identity(self):
+        log.info("Running identity setup...")
+        creds = load_credentials() or {}
+        owner_eoa = creds.get("owner_eoa", "")
+        if owner_eoa:
+            if AUTO_SC_WALLET:
+                await ensure_molty_wallet(self.api, owner_eoa)
+            if AUTO_WHITELIST:
+                await ensure_whitelist(self.api, owner_eoa, creds.get("agent_wallet_address"))
+            if AUTO_IDENTITY:
+                await ensure_identity(self.api)
+        log.info("Setup selesai.")
 
 
 if __name__ == "__main__":
