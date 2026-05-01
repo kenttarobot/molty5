@@ -29,24 +29,24 @@ log = get_logger(__name__)
 
 
 # =========================
-# 🔥 HYBRID AI LAYER (INJECTED)
+# 🔥 SIMULATION ENGINE
 # =========================
-import os, json
-USE_LLM = bool(os.getenv("OPENAI_API_KEY"))
-STRATEGY = {"mode": "balanced", "risk": 0.5}
-TURN_COUNTER = 0
+def simulate_combat(my_hp, my_atk, my_def, enemy, equipped, weather):
+    enemy_hp = enemy.get("hp", 100)
 
-def ask_llm_strategy(view):
-    try:
-        from openai import OpenAI
-        client = OpenAI()
-        res = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": f"HP:{view['self']['hp']} EP:{view['self']['ep']} Alive:{view.get('aliveCount')} Enemies:{len(view.get('visibleAgents', []))}"}],
-        )
-        return {"mode": "aggressive" if "attack" in res.choices[0].message.content.lower() else "balanced", "risk": 0.5}
-    except:
-        return {"mode": "balanced", "risk": 0.5}
+    my_dmg = calc_damage(my_atk, get_weapon_bonus(equipped),
+                         enemy.get("def", 5), weather)
+
+    enemy_dmg = calc_damage(enemy.get("atk", 10),
+                            _estimate_enemy_weapon_bonus(enemy),
+                            my_def, weather)
+
+    return {
+        "my_hp": my_hp - enemy_dmg,
+        "enemy_hp": enemy_hp - my_dmg,
+        "win": (enemy_hp - my_dmg) <= 0,
+        "survive": (my_hp - enemy_dmg) > 0
+    }
 
 
 # ── Weapon stats from combat-items.md ─────────────────────────────────
@@ -177,13 +177,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
     Uses ALL api-summary.md view fields for decision making.
     """
-    
-    global TURN_COUNTER, STRATEGY
-    TURN_COUNTER += 1
-    if USE_LLM and TURN_COUNTER % 5 == 0:
-        STRATEGY.update(ask_llm_strategy(view))
     self_data = view.get("self", {})
-
     region = view.get("currentRegion", {})
     hp = self_data.get("hp", 100)
     ep = self_data.get("ep", 10)
@@ -351,6 +345,8 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                                   f"(120 sMoltz! dmg={my_dmg} vs {guardian_dmg})"}
 
     # ── Priority 6: Favorable agent combat ────────────────────────
+    # 🔥 SIMULATION ENHANCED COMBAT
+
     # Be more aggressive when fewer agents remain (late game)
     # Per game-systems.md: avoid combat in storm(-15%) or fog(-10%)
     hp_threshold = 40 if alive_count > 20 else 25
@@ -411,50 +407,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     if ep < 4 and not enemies and not region.get("isDeathZone") and region_id not in danger_ids:
         return {"action": "rest", "data": {},
                 "reason": f"REST: EP={ep}/{max_ep}, area is safe (+1 bonus EP)"}
-
-    
-    # =========================
-    # 🧠 UTILITY AI (FINAL LAYER)
-    # =========================
-    try:
-        mode = STRATEGY.get("mode", "balanced")
-        risk = STRATEGY.get("risk", 0.5)
-
-        candidates = []
-
-        # Heal scoring
-        heal_item = _find_healing_item(inventory, critical=(hp < 30))
-        if heal_item:
-            score = (100 - hp) * 1.5
-            if mode == "defensive":
-                score *= 1.4
-            candidates.append((score, {"action": "use_item", "data": {"itemId": heal_item["id"]}, "reason": "UTILITY_HEAL"}))
-
-        # Attack scoring
-        enemies_util = [a for a in visible_agents if a.get("isAlive") and not a.get("isGuardian")]
-        if enemies_util:
-            target = _select_weakest(enemies_util)
-            my_dmg = calc_damage(atk, get_weapon_bonus(equipped), target.get("def", 5), region_weather)
-            enemy_dmg = calc_damage(target.get("atk", 10), _estimate_enemy_weapon_bonus(target), defense, region_weather)
-            score = (my_dmg - enemy_dmg) * 2
-            if mode == "aggressive":
-                score *= (1.2 + risk)
-            if score > 0:
-                candidates.append((score, {"action": "attack", "data": {"targetId": target["id"], "targetType": "agent"}, "reason": "UTILITY_ATTACK"}))
-
-        # Move scoring
-        if ep >= move_ep_cost:
-            for conn in connections:
-                rid = conn if isinstance(conn, str) else conn.get("id", "")
-                if rid:
-                    score = 10
-                    candidates.append((score, {"action": "move", "data": {"regionId": rid}, "reason": "UTILITY_MOVE"}))
-
-        if candidates:
-            best = max(candidates, key=lambda x: x[0])[1]
-            return best
-    except Exception as e:
-        log.debug("Utility fallback error: %s", e)
 
     return None  # Wait for next turn
 
