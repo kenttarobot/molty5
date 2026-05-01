@@ -70,11 +70,13 @@ class MoltyAPI:
     def _extract_version_from_error(self, error_text: str) -> Optional[str]:
         """Extract expected version from error message."""
         patterns = [
+            r'to v?(\d+\.\d+\.\d+)',
             r'expected[:\s]+v?(\d+\.\d+\.\d+)',
             r'requires[:\s]+v?(\d+\.\d+\.\d+)',
             r'need[:\s]+v?(\d+\.\d+\.\d+)',
             r'version[:\s]+(\d+\.\d+\.\d+)',
             r'upgrade to v?(\d+\.\d+\.\d+)',
+            r'update your skill to v?(\d+\.\d+\.\d+)',  # Dari error message Anda
         ]
         for pattern in patterns:
             match = re.search(pattern, error_text, re.I)
@@ -100,6 +102,16 @@ class MoltyAPI:
         if resp.status_code == 426:
             error_text = resp.text
             expected_version = self._extract_version_from_error(error_text)
+            
+            # Parse error message from response
+            try:
+                error_data = json.loads(error_text)
+                if "error" in error_data and isinstance(error_data["error"], dict):
+                    msg = error_data["error"].get("message", "")
+                    if not expected_version:
+                        expected_version = self._extract_version_from_error(msg)
+            except:
+                pass
             
             if expected_version:
                 log.error(f"Version mismatch! Agent={SKILL_VERSION}, Server requires={expected_version}")
@@ -163,25 +175,17 @@ class MoltyAPI:
             version_info = await self.get_version()
             log.info(f"Server version info: {version_info}")
             
-            # Extract required version
-            required_version = version_info.get("minVersion")
-            if not required_version:
-                required_version = version_info.get("requiredVersion")
-            if not required_version:
-                required_version = version_info.get("version")
+            # Extract required version - gunakan version dari server
+            server_version = version_info.get("version", "1.6.0")
             
-            if required_version:
-                # Compare versions (simple string compare for now)
-                if SKILL_VERSION >= required_version:
-                    log.info(f"✓ Version check passed: {SKILL_VERSION} >= {required_version}")
-                    self._version_checked = True
-                    return True, required_version
-                else:
-                    log.warning(f"✗ Version too low: {SKILL_VERSION} < {required_version}")
-                    return False, required_version
-            
-            self._version_checked = True
-            return True, None
+            # Yang penting: agent version HARUS sama persis dengan server version
+            if SKILL_VERSION == server_version:
+                log.info(f"✓ Version check passed: {SKILL_VERSION} == {server_version}")
+                self._version_checked = True
+                return True, server_version
+            else:
+                log.warning(f"✗ Version mismatch: Agent={SKILL_VERSION}, Server={server_version}")
+                return False, server_version
             
         except APIError as e:
             if e.code == "VERSION_MISMATCH":
