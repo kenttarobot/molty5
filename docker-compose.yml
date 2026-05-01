@@ -1,53 +1,35 @@
 version: '3.8'
 
-# Definisikan network yang sama agar bot bisa saling terhubung jika perlu
-networks:
-  molty-network:
-    driver: bridge
-
 services:
-  # Template untuk setiap bot, untuk menghindari pengulangan
-  bot-base: &bot-base
-    build: .
-    networks:
-      - molty-network
-    environment: &bot-env-base
-      - ROOM_MODE=free
-      - ADVANCED_MODE=true
-      - LOG_LEVEL=INFO
-      # Team ID yang sama agar saling kenal
-      - TEAM_ID=THEO_SQUAD
-    restart: unless-stopped
-
-  # Bot 1: theobdg1
   bot1:
-    <<: *bot-base
+    build: .
     container_name: molty-theobdg1
     environment:
-      <<: *bot-env-base
       - AGENT_NAME=theobdg1
+      - TEAM_ID=THEO_SQUAD
+      - ROOM_MODE=free
       - WEB_PORT=8081
     ports:
-      - "8081:8081" # Dashboard untuk bot1
+      - "8081:8081"
 
-  # Bot 2: theobdg2
   bot2:
-    <<: *bot-base
+    build: .
     container_name: molty-theobdg2
     environment:
-      <<: *bot-env-base
       - AGENT_NAME=theobdg2
+      - TEAM_ID=THEO_SQUAD
+      - ROOM_MODE=free
       - WEB_PORT=8082
     ports:
-      - "8082:8082" # Dashboard untuk bot2
+      - "8082:8082"
 
-  # Bot 3: theobdg3
   bot3:
-    <<: *bot-base
+    build: .
     container_name: molty-theobdg3
     environment:
-      <<: *bot-env-base
       - AGENT_NAME=theobdg3
+      - TEAM_ID=THEO_SQUAD
+      - ROOM_MODE=free
       - WEB_PORT=8083
     ports:
-      - "8083:8083" # Dashboard untuk bot3
+      - "8083:8083"
