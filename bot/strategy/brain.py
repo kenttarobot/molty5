@@ -1,10 +1,16 @@
 """
-Strategy brain — BERSERKER MODE v2.3 (FIX FACILITY LOOP)
+Strategy brain — BERSERKER MODE v2.2 (FINISH THE KILL)
 ===========================================================
-PERBAIKAN:
-- FIX: Bot tidak akan stuck di facility (broadcast_station)
-- PRIORITAS: Combat > Facility > Movement
-- Tambahan: Batasi interact facility yang sama
+FITUR BARU:
+- HUNTING MODE: Jika sudah attack musuh → terus kejar sampai mati
+- Tidak akan kabur atau ganti target sampai musuh HABIS
+- Prioritaskan musuh yang sudah dilukai (HP < 50)
+- Strategi lainnya tetap berjalan (healing, EP, farming)
+
+PERBAIKAN SEBELUMNYA:
+- CEK HP sebelum attack (tidak attack jika HP < 35)
+- CEK DAMAGE MUSUH (kabur jika damage > 30)
+- HEALING PRIORITAS #2
 """
 
 from bot.utils.logger import get_logger
@@ -13,7 +19,7 @@ log = get_logger(__name__)
 
 
 # =========================
-# 🔥 KONFIGURASI BERSERKER v2.3
+# 🔥 KONFIGURASI BERSERKER v2.2
 # =========================
 
 WEAPONS = {
@@ -50,7 +56,7 @@ WEATHER_COMBAT_PENALTY = {
     "storm": 0.15,
 }
 
-# ── BERSERKER THRESHOLDS v2.3 ────────────────────────────────────────
+# ── BERSERKER THRESHOLDS v2.2 ────────────────────────────────────────
 BERSERKER_CONFIG = {
     "HEAL_CRITICAL": 25,
     "HEAL_URGENT": 35,
@@ -62,38 +68,31 @@ BERSERKER_CONFIG = {
     "EP_MIN_ATTACK": 0.20,
     "EP_SAFE": 0.15,
     
-    # Hunting mode
-    "HUNTING_MODE": True,
-    "HUNT_UNTIL_DEATH": True,
-    "TARGET_MARK_DURATION": 10,
-    "WOUNDED_HP_THRESHOLD": 50,
-    "LOW_HP_PRIORITY": 40,
-    "EXECUTE_PRIORITY": 30,
-    
-    # ── BARU: Facility cooldown ─────────────────────────────────────
-    "MAX_FACILITY_INTERACTIONS": 1,      # Maksimal 1x interact per facility
-    "FACILITY_COOLDOWN_TURNS": 10,       # Cooldown 10 turn sebelum interact lagi
+    # ── FITUR BARU: FINISH THE KILL ──────────────────────────────────
+    "HUNTING_MODE": True,               # AKTIFKAN HUNTING MODE
+    "HUNT_UNTIL_DEATH": True,           # Kejar sampai mati
+    "TARGET_MARK_DURATION": 10,         # Berapa turn target tetap diingat
+    "WOUNDED_HP_THRESHOLD": 50,         # Musuh dengan HP < 50 dianggap terluka
+    "LOW_HP_PRIORITY": 40,              # Musuh HP < 40 prioritas tertinggi
+    "EXECUTE_PRIORITY": 30,             # Musuh HP < 30 = WAJIB SERANG!
 }
 
 _known_agents: dict = {}
 _map_knowledge: dict = {"revealed": False, "death_zones": set(), "safe_center": []}
-_hunting_target: dict = None
-_hunting_timer: int = 0
-
-# ── BARU: Track facility yang sudah di-interact ──────────────────────
-_interacted_facilities: dict = {}  # {facility_id: turn_interacted}
+_hunting_target: dict = None          # Target yang sedang diburu
+_hunting_timer: int = 0               # Counter untuk hunting
 
 
 def reset_game_state():
-    global _known_agents, _map_knowledge, _hunting_target, _hunting_timer, _interacted_facilities
+    global _known_agents, _map_knowledge, _hunting_target, _hunting_timer
     _known_agents = {}
     _map_knowledge = {"revealed": False, "death_zones": set(), "safe_center": []}
     _hunting_target = None
     _hunting_timer = 0
-    _interacted_facilities = {}
     log.info("=" * 60)
-    log.info("BERSERKER MODE v2.3 (FIX FACILITY LOOP)")
-    log.info("Prioritas: COMBAT > FACILITY > MOVEMENT")
+    log.info("BERSERKER MODE v2.2 (FINISH THE KILL)")
+    log.info("Fiturnya enggak ada yang lewat, semua kita habisi!")
+    log.info("Attack jika HP > 35, kabur hanya jika HP < 20")
     log.info("=" * 60)
 
 
@@ -352,48 +351,21 @@ def _use_utility_item(inventory: list, hp: int, ep: int, alive_count: int) -> di
     return None
 
 
-def _select_facility_with_limit(interactables: list, hp: int, ep: int, current_turn: int) -> dict | None:
-    """
-    Pilih facility dengan batasan:
-    - Tidak akan interact facility yang sudah di-interact sebelumnya (atau cooldown)
-    - Prioritaskan medical_facility (jika HP rendah)
-    """
-    global _interacted_facilities
-    
-    if not interactables:
-        return None
-    
-    # Bersihkan facility lama (lebih dari cooldown)
-    cooldown = BERSERKER_CONFIG["FACILITY_COOLDOWN_TURNS"]
-    expired = [fid for fid, turn in _interacted_facilities.items() if current_turn - turn > cooldown]
-    for fid in expired:
-        del _interacted_facilities[fid]
-    
+def _select_facility(interactables: list, hp: int, ep: int) -> dict | None:
     for fac in interactables:
         if not isinstance(fac, dict):
             continue
         if fac.get("isUsed"):
             continue
-        
-        fid = fac.get("id", "")
-        
-        # Cek apakah facility sudah pernah di-interact baru-baru ini
-        if fid in _interacted_facilities:
-            log.debug("Facility %s on cooldown (interacted at turn %d)", 
-                     fac.get("type", "unknown"), _interacted_facilities[fid])
-            continue
-        
         ftype = fac.get("type", "").lower()
-        
-        # Medical facility: hanya jika HP rendah
-        if ftype == "medical_facility" and hp < 70:
+        if ftype == "medical_facility" and hp < 80:
             return fac
-        
-        # Facility lain: hanya jika tidak ada musuh
-        if ftype in ["supply_cache", "watchtower", "broadcast_station"]:
-            # Batasi maksimal interact per facility
+        if ftype == "supply_cache":
             return fac
-    
+        if ftype == "watchtower":
+            return fac
+        if ftype == "broadcast_station":
+            return fac
     return None
 
 
@@ -477,33 +449,47 @@ def _choose_move_target(connections, danger_ids: set,
     return candidates[0][0]
 
 
+# =========================
+# 🧠 FITUR UTAMA: SELECT TARGET PRIORITY (FINISH THE KILL)
+# =========================
+
 def select_target_with_priority(enemies: list, current_target: dict = None) -> dict | None:
+    """
+    Prioritas target (HUNTING MODE):
+    1. TARGET YANG SEDANG DIBURU (jika masih hidup)
+    2. MUSUH DENGAN HP < 30 (execute priority)
+    3. MUSUH DENGAN HP < 50 (wounded)
+    4. MUSUH DENGAN HP TERENDAH
+    """
     if not enemies:
         return None
     
+    # Hapus target yang sudah mati dari memori
     global _hunting_target, _hunting_timer
     
-    # PRIORITY 1: Hunting target
+    # PRIORITY 1: Hunting target (yang sudah pernah diserang)
     if BERSERKER_CONFIG["HUNTING_MODE"] and _hunting_target:
+        # Cek apakah target masih hidup
         target_alive = False
         for enemy in enemies:
             if enemy.get("id") == _hunting_target.get("id"):
                 target_alive = True
-                _hunting_target = enemy
+                _hunting_target = enemy  # Update data target
                 break
         
         if target_alive:
-            log.info("HUNTING TARGET: Melanjutkan berburu!")
+            log.info("HUNTING TARGET: Melanjutkan berburu musuh ini!")
             return _hunting_target
         else:
+            # Target sudah mati, reset hunting
             log.info("HUNTING COMPLETE: Target sudah mati!")
             _hunting_target = None
     
-    # PRIORITY 2: Execute (HP < 30)
+    # PRIORITY 2: Execute (HP < 30) - WAJIB SERANG!
     execute_targets = [e for e in enemies if e.get("hp", 100) < BERSERKER_CONFIG["EXECUTE_PRIORITY"]]
     if execute_targets:
         target = min(execute_targets, key=lambda e: e.get("hp", 999))
-        log.info("EXECUTE PRIORITY: Musuh HP=%d!", target.get("hp", 0))
+        log.info("EXECUTE PRIORITY: Musuh HP=%d, FINISH HIM!", target.get("hp", 0))
         return target
     
     # PRIORITY 3: Wounded (HP < 50)
@@ -518,6 +504,7 @@ def select_target_with_priority(enemies: list, current_target: dict = None) -> d
 
 
 def update_hunting_target(target: dict):
+    """Simpan target yang sedang diburu"""
     global _hunting_target, _hunting_timer
     if target and BERSERKER_CONFIG["HUNTING_MODE"]:
         _hunting_target = target
@@ -530,8 +517,7 @@ def update_hunting_target(target: dict):
 # =========================
 
 def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict | None:
-    global _hunting_target, _hunting_timer, _interacted_facilities
-    import time
+    global _hunting_target, _hunting_timer
     
     self_data = view.get("self", {})
     region = view.get("currentRegion", {})
@@ -571,9 +557,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
     if not is_alive:
         return None
-
-    # Current turn (gunakan turn counter atau timestamp)
-    current_turn = view.get("turn", 0) or int(time.time())
 
     # Decrement hunting timer
     if _hunting_timer > 0:
@@ -645,16 +628,19 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "reason": f"CRITICAL HEAL: HP={hp}"}
 
     # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 3: FLEE (hanya jika benar-benar kritis)
+    # PRIORITY 3: FLEE (hanya jika HP benar-benar kritis, BUKAN karena kejar target!)
     # ═══════════════════════════════════════════════════════════════
     should_flee = False
     flee_reason = ""
     
+    # Jika sedang hunting target, JANGAN KABUR KECUALI HP SANGAT KRITIS!
     if _hunting_target:
-        if hp < 15:
+        if hp < 15:  # Hanya kabur jika HP benar-benar sekarat
             should_flee = True
             flee_reason = f"CRITICAL HP DURING HUNT ({hp})"
+        # Selain itu, TETAP KEJAR target meskipun HP rendah!
     else:
+        # Jika tidak sedang hunting, gunakan threshold normal
         if hp < BERSERKER_CONFIG["FLEE_HP"]:
             should_flee = True
             flee_reason = f"CRITICAL HP ({hp})"
@@ -673,11 +659,12 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "reason": f"FLEE: {flee_reason}"}
 
     # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 4: COUNTER ATTACK (PRIORITAS UTAMA!)
+    # PRIORITY 4: COUNTER ATTACK (DENGAN PRIORITAS TARGET)
     # ═══════════════════════════════════════════════════════════════
     can_attack = (hp >= BERSERKER_CONFIG["MIN_HP_TO_ATTACK"] and 
                   ep_ratio >= BERSERKER_CONFIG["EP_MIN_ATTACK"])
     
+    # Jika sedang hunting target, abaikan MIN_HP_TO_ATTACK (kecuali HP terlalu rendah)
     if _hunting_target and hp >= 15:
         can_attack = True
     
@@ -692,6 +679,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                                     target.get("def", 5), region_weather)
                 enemy_hp = target.get("hp", 100)
                 
+                # Simpan sebagai hunting target
                 if BERSERKER_CONFIG["HUNTING_MODE"] and not _hunting_target:
                     update_hunting_target(target)
                 
@@ -701,7 +689,10 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                 return {"action": "attack",
                         "data": {"targetId": target["id"], "targetType": "agent"},
                         "reason": f"BERSERKER: HP={enemy_hp}"}
-    
+        
+        elif enemies_here and hp < BERSERKER_CONFIG["MIN_HP_TO_ATTACK"] and not _hunting_target:
+            log.warning("HP=%d too low to attack new target! Healing/fleeing instead!", hp)
+
     # ═══════════════════════════════════════════════════════════════
     # PRIORITY 5: GUARDIAN FARMING
     # ═══════════════════════════════════════════════════════════════
@@ -735,20 +726,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         return None
 
     # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 6: FACILITY INTERACTION (DENGAN BATASAN!)
-    # ═══════════════════════════════════════════════════════════════
-    # Hanya interact facility jika TIDAK ADA MUSUH di region!
-    if not enemies_here and not guardians_here:
-        facility = _select_facility_with_limit(interactables, hp, ep, current_turn)
-        if facility:
-            fid = facility.get("id", "")
-            _interacted_facilities[fid] = current_turn
-            log.info("FACILITY INTERACT: %s", facility.get("type", "unknown"))
-            return {"action": "interact", "data": {"interactableId": facility["id"]},
-                    "reason": f"FACILITY: {facility.get('type', 'unknown')}"}
-
-    # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 7: MODERATE HEALING
+    # PRIORITY 6: MODERATE HEALING
     # ═══════════════════════════════════════════════════════════════
     if hp < BERSERKER_CONFIG["HEAL_MODERATE"] and not enemies_here and not _hunting_target:
         heal = _find_healing_item(inventory, critical=False)
@@ -758,7 +736,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "reason": f"HEAL: HP={hp}"}
 
     # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 8: EP RECOVERY
+    # PRIORITY 7: EP RECOVERY
     # ═══════════════════════════════════════════════════════════════
     if ep_ratio < BERSERKER_CONFIG["EP_SAFE"]:
         energy_drink = _find_energy_drink(inventory)
@@ -771,7 +749,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "reason": f"REST: EP={ep}/{max_ep}"}
 
     # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 9: MONSTER FARMING
+    # PRIORITY 8: MONSTER FARMING
     # ═══════════════════════════════════════════════════════════════
     monsters = [m for m in visible_monsters if m.get("hp", 0) > 0]
     if monsters and ep >= 1 and hp > 40 and not enemies_here and not _hunting_target:
@@ -783,13 +761,23 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "reason": f"MONSTER: HP={target.get('hp', '?')}"}
 
     # ═══════════════════════════════════════════════════════════════
-    # PRIORITY 10: MOVEMENT (KEJAR TARGET ATAU CARI AMAN)
+    # PRIORITY 9: FACILITY
+    # ═══════════════════════════════════════════════════════════════
+    if interactables and ep >= 2 and not region.get("isDeathZone"):
+        facility = _select_facility(interactables, hp, ep)
+        if facility:
+            return {"action": "interact", "data": {"interactableId": facility["id"]},
+                    "reason": f"FACILITY: {facility.get('type', 'unknown')}"}
+
+    # ═══════════════════════════════════════════════════════════════
+    # PRIORITY 10: MOVEMENT (JIKA SEDANG HUNTING, KEJAR TARGET!)
     # ═══════════════════════════════════════════════════════════════
     if ep >= move_ep_cost and connections:
+        # Jika sedang hunting, cari region target
         if _hunting_target:
             target_region = _hunting_target.get("regionId", "")
             if target_region and target_region != region_id and target_region not in danger_ids:
-                log.info("HUNTING: Moving to chase target!")
+                log.info("HUNTING: Moving to chase target at %s", target_region[:8])
                 return {"action": "move", "data": {"regionId": target_region},
                         "reason": "HUNTING: Kejar target!"}
         
@@ -810,12 +798,13 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
 
 """
-BERSERKER MODE v2.3 - FIX FACILITY LOOP
+BERSERKER MODE v2.2 - FINISH THE KILL
 
-PERUBAHAN PALING PENTING:
-1. ✅ BOT TIDAK AKAN STUCK DI FACILITY!
-2. ✅ Prioritas: COMBAT > FACILITY > MOVEMENT
-3. ✅ Facility hanya di-interact jika TIDAK ADA MUSUH
-4. ✅ Facility cooldown: tidak akan interact facility yang sama berulang-ulang
-5. ✅ Maksimal 1x interact per facility
+FITUR BARU:
+1. HUNTING MODE: Setelah attack musuh, terus kejar sampai mati
+2. TIDAK KABUR saat sedang hunting (kecuali HP < 15)
+3. PRIORITAS TARGET: Hunting target > Execute (HP<30) > Wounded (HP<50) > Weakest
+4. AUTO CHASE: Pindah region untuk kejar target
+
+Bot akan menyelesaikan musuh yang sudah dilukai sampai benar-benar mati!
 """
