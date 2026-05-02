@@ -2021,9 +2021,9 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     # ═══════════════════════════════════════════════════════════════
     if ep < 4 and not enemies_here and not region.get("isDeathZone") and region_id not in danger_ids:
         return {"action": "rest", "data": {}, "reason": f"REST: EP={ep}/{max_ep}"}
-
-    return None
-
+    # fallback terakhir kalau tidak ada aksi lain
+    return {"action": "rest", "data": {}, "reason": "REST fallback"}
+    
 
 # ═══════════════════════════════════════════════════════════════════
 #  EVENT HOOKS — Dipanggil dari heartbeat.py / game loop
