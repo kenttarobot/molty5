@@ -1,18 +1,17 @@
 """
-Strategy brain — BERSERKER MODE v4.4 (BLACKLIST SYSTEM)
+Strategy brain — BERSERKER MODE v4.5 (BALANCED AGGRESSION)
 ===========================================================================
-PERBAIKAN DARI v4.3:
-- ADDED: BLACKLIST untuk musuh berbahaya (damage > 30 atau pernah kill kita)
-- ADDED: Persistent memory of dangerous enemies across game resets
-- FIX: Bot tidak akan pursuit musuh yang ada di blacklist
-- FIX: Bot akan menghindari region dengan musuh blacklist
-- IMPROVED: AFTER_HEAL logic - jangan langsung cari musuh lagi
+PERBAIKAN DARI v4.4:
+- FIX: Bot terlalu defensif, tidak pernah attack
+- LOWERED: Threshold HP untuk attack (55 → 45)
+- LOWERED: Threshold HP untuk heal (45 → 40)
+- ADDED: Active enemy seeking jika HP dan EP cukup
+- FIX: Blacklist hanya untuk damage > 40 (bukan 30)
+- IMPROVED: Bot akan attack monster lebih agresif
 ===========================================================================
 """
 
 import time
-import json
-import os
 from collections import defaultdict, deque
 from enum import Enum
 from bot.utils.logger import get_logger
@@ -55,56 +54,56 @@ WEATHER_COMBAT_PENALTY = {
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  KONFIGURASI BERSERKER v4.4
+#  KONFIGURASI BERSERKER v4.5 (BALANCED)
 # ═══════════════════════════════════════════════════════════════════
 
 BERSERKER_CONFIG = {
-    # ── HP & EP Management ──────────────────────────────────────────
-    "HP_MINIMUM":            50,
-    "HP_CRITICAL":           25,
-    "HP_HEAL_URGENT":        45,
-    "HP_HEAL_MODERATE":      60,
-    "EP_MINIMUM_RATIO":      0.50,
-    "EP_ATTACK_MIN_RATIO":   0.25,
-    "EP_SAFE_RATIO":         0.15,
+    # ── HP & EP Management (LEBIH AGGRESIF) ─────────────────────────
+    "HP_MINIMUM":            40,          # Diturunkan dari 50
+    "HP_CRITICAL":           20,          # Diturunkan dari 25
+    "HP_HEAL_URGENT":        40,          # Diturunkan dari 45
+    "HP_HEAL_MODERATE":      55,          # Diturunkan dari 60
+    "EP_MINIMUM_RATIO":      0.40,        # Diturunkan dari 0.50
+    "EP_ATTACK_MIN_RATIO":   0.20,        # Diturunkan dari 0.25
+    "EP_SAFE_RATIO":         0.10,        # Diturunkan dari 0.15
 
-    # ── Combat & Survival ───────────────────────────────────────────
-    "MIN_HP_TO_ATTACK":      55,          # Dinaikkan dari 50
-    "MIN_HP_TO_ATTACK_GUARDIAN": 65,
-    "COUNTER_ATTACK_HP":     35,          # Dinaikkan dari 30
+    # ── Combat & Survival (LEBIH BERANI) ─────────────────────────────
+    "MIN_HP_TO_ATTACK":      40,          # Diturunkan dari 55!
+    "MIN_HP_TO_ATTACK_GUARDIAN": 55,      # Diturunkan dari 65
+    "COUNTER_ATTACK_HP":     25,          # Diturunkan dari 35
     "NEVER_FLEE_IF_ATTACKED": True,
     
     # ── Damage Comparison ───────────────────────────────────────────
-    "MAX_ENEMY_DAMAGE_RATIO": 2.0,
-    "DANGEROUS_ENEMY_DAMAGE": 30,
-    "FLEE_STRONG_ENEMY_RATIO": 1.5,
-    "BLACKLIST_DAMAGE_THRESHOLD": 30,     # Damage > 30 = blacklist
-    "BLACKLIST_WINRATE_THRESHOLD": 0.6,   # Winrate > 60% = blacklist
+    "MAX_ENEMY_DAMAGE_RATIO": 2.5,        # Dinaikkan dari 2.0 (lebih berani)
+    "DANGEROUS_ENEMY_DAMAGE": 35,
+    "FLEE_STRONG_ENEMY_RATIO": 2.0,       # Dinaikkan dari 1.5
+    "BLACKLIST_DAMAGE_THRESHOLD": 40,     # Dinaikkan dari 30!
+    "BLACKLIST_WINRATE_THRESHOLD": 0.7,   # Dinaikkan dari 0.6
     
     # ── Survival Mode ───────────────────────────────────────────────
-    "SURVIVAL_MODE_HP":      40,
-    "SURVIVAL_FLEE_RATIO":   1.2,
-    "FARM_TURNS_BEFORE_FIGHT": 35,        # Dinaikkan dari 30
+    "SURVIVAL_MODE_HP":      30,          # Diturunkan dari 40
+    "SURVIVAL_FLEE_RATIO":   1.5,         # Dinaikkan dari 1.2
+    "FARM_TURNS_BEFORE_FIGHT": 15,        # Diturunkan dari 35! (lebih cepat cari musuh)
     
-    # ── Pursuit (JANGAN CHASE MUSUH BLACKLIST!) ──────────────────────
+    # ── Pursuit (LEBIH AGGRESIF) ─────────────────────────────────────
     "PURSUIT_ENABLED":       True,
-    "PURSUIT_MAX_HOPS":      2,
-    "PURSUIT_MIN_HP":        70,          # Dinaikkan dari 60
+    "PURSUIT_MAX_HOPS":      3,
+    "PURSUIT_MIN_HP":        50,          # Diturunkan dari 70
     
     # ── Recovery Mode ───────────────────────────────────────────────
-    "RECOVERY_HP_THRESHOLD": 35,
-    "RECOVERY_TARGET_HP":    80,          # Dinaikkan dari 75
+    "RECOVERY_HP_THRESHOLD": 30,          # Diturunkan dari 35
+    "RECOVERY_TARGET_HP":    70,          # Diturunkan dari 80
     "RECOVERY_FARM_GUARDIAN": True,
-    "RECOVERY_FARM_GUARDIAN_MIN_HP": 60,
+    "RECOVERY_FARM_GUARDIAN_MIN_HP": 50,
 
-    # ── Hunting (JANGAN HUNT MUSUH BLACKLIST!) ───────────────────────
+    # ── Hunting ─────────────────────────────────────────────────────
     "HUNTING_MODE":          True,
     "HUNT_UNTIL_DEATH":      False,
-    "TARGET_MARK_DURATION":  15,
-    "EXECUTE_HP_THRESHOLD":  30,
-    "WOUNDED_HP_THRESHOLD":  50,
-    "MIN_HP_TO_HUNT":        75,          # Dinaikkan dari 70
-    "MIN_DAMAGE_TO_HUNT":    15,
+    "TARGET_MARK_DURATION":  20,
+    "EXECUTE_HP_THRESHOLD":  35,          # Dinaikkan dari 30
+    "WOUNDED_HP_THRESHOLD":  55,          # Dinaikkan dari 50
+    "MIN_HP_TO_HUNT":        60,          # Diturunkan dari 75
+    "MIN_DAMAGE_TO_HUNT":    10,
 
     # ── Enemy Profiling ─────────────────────────────────────────────
     "PROFILE_MEMORY_SIZE":   100,
@@ -119,12 +118,12 @@ BERSERKER_CONFIG = {
     "FACILITY_COOLDOWN_TURNS":   10,
     "BROADCAST_STATION_ONCE":    True,
 
-    # ── Flee ─────────────────────────────────────────────────────────
-    "FLEE_HP":               15,
-    "FLEE_OUTNUMBERED":      3,
+    # ── Flee (LEBIH BERANI) ──────────────────────────────────────────
+    "FLEE_HP":               12,
+    "FLEE_OUTNUMBERED":      4,
     
     # ── Post-Heal Behavior ──────────────────────────────────────────
-    "SAFE_TURNS_AFTER_HEAL": 10,          # Setelah heal, jangan cari musuh selama 10 turn
+    "SAFE_TURNS_AFTER_HEAL": 5,           # Diturunkan dari 10
 }
 
 
@@ -194,7 +193,7 @@ class EnemyMemory:
             self.real_damage_samples.pop(0)
         self.estimated_damage = sum(self.real_damage_samples) // max(1, len(self.real_damage_samples))
         
-        # Auto-blacklist jika damage terlalu tinggi
+        # Auto-blacklist jika damage terlalu tinggi (dinaikkan thresholdnya)
         if self.estimated_damage >= BERSERKER_CONFIG["BLACKLIST_DAMAGE_THRESHOLD"]:
             self.is_blacklisted = True
             self.blacklist_reason = f"damage={self.estimated_damage}"
@@ -211,7 +210,7 @@ class EnemyMemory:
     def is_dangerous(self, my_damage: int) -> bool:
         if self.is_blacklisted:
             return True
-        return self.estimated_damage > my_damage * 1.5 or self.estimated_damage > 30
+        return self.estimated_damage > my_damage * 1.8 or self.estimated_damage > 35
         
     def record_combat(self, combat_data: dict):
         self.combat_logs.append({
@@ -267,7 +266,7 @@ class EnemyMemory:
             elif "counter" in str(self.combat_logs):
                 self.primary_style = PlayerStyle.COUNTER_ATTACKER
         
-        if self.estimated_damage > 30:
+        if self.estimated_damage > 35:
             self.primary_style = PlayerStyle.STRONG
         
         self.confidence = min(0.9, 0.5 + (len(self.combat_logs) * 0.05))
@@ -310,12 +309,12 @@ class EnemyMemory:
             return advice
         
         win_rate_vs_us = self.victories_against_us / max(1, self.encounters)
-        if win_rate_vs_us > 0.6 and self.encounters > 2:
+        if win_rate_vs_us > 0.7 and self.encounters > 2:
             advice["should_fight"] = False
             advice["special_notes"].append(f"Beats us {win_rate_vs_us:.0%} of time - AVOID!")
             return advice
         
-        if my_hp < 45:
+        if my_hp < 35:
             advice["should_fight"] = False
             advice["special_notes"].append(f"HP too low: {my_hp}")
         
@@ -336,8 +335,8 @@ _last_attacked_by: str = None
 _last_attacked_turn: int = 0
 _broadcast_used: bool = False
 _broadcast_region_used: str = None
-_last_heal_turn: int = 0  # Track kapan terakhir heal
-_post_heal_safe_turns: int = 0  # Sisa turn aman setelah heal
+_last_heal_turn: int = 0
+_post_heal_safe_turns: int = 0
 
 _enemy_profiles: dict = {}
 _enemy_memories: dict = {}
@@ -360,7 +359,7 @@ _active_special_counters: dict = {}
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  ENEMY PROFILING SYSTEM (Legacy)
+#  ENEMY PROFILING SYSTEM (Legacy) - DISINGKAT KARENA PANJANG
 # ═══════════════════════════════════════════════════════════════════
 
 def _get_or_create_profile(enemy_id: str) -> dict:
@@ -616,7 +615,7 @@ def _pickup_score_v3(item: dict, inventory: list, heal_count: int) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  UTILITY FUNCTIONS (DISINGKAT - SAMA DENGAN SEBELUMNYA)
+#  UTILITY FUNCTIONS (DISINGKAT)
 # ═══════════════════════════════════════════════════════════════════
 
 def learn_from_map(view: dict):
@@ -795,7 +794,7 @@ def _use_utility_item(inventory: list) -> dict | None:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  FACILITY SELECTION
+#  FACILITY SELECTION (SAMA)
 # ═══════════════════════════════════════════════════════════════════
 
 def _select_facility_with_limit(interactables: list, hp: int, ep: int, current_turn: int, current_region_id: str) -> dict | None:
@@ -905,7 +904,6 @@ def _track_agents(visible_agents: list, my_id: str, my_region: str, current_turn
 
 
 def _get_region_danger_score(region: dict, my_damage: int, defense: int, weather: str, enemy_memories: dict) -> int:
-    """Hitung score bahaya untuk suatu region berdasarkan musuh di dalamnya"""
     agents = region.get("agents", [])
     if not agents:
         return 0
@@ -916,17 +914,18 @@ def _get_region_danger_score(region: dict, my_damage: int, defense: int, weather
             continue
         
         aid = agent.get("id", "")
-        # Cek blacklist
         if aid in enemy_memories and enemy_memories[aid].is_blacklisted:
-            total_danger += 500  # BLACKLISTED = sangat berbahaya!
+            total_danger += 500
         else:
             enemy_damage = _estimate_enemy_damage(agent, defense, weather)
-            if enemy_damage > my_damage * 1.5:
+            if enemy_damage > my_damage * 2.0:
                 total_danger += 100
-            elif enemy_damage > my_damage:
+            elif enemy_damage > my_damage * 1.5:
                 total_danger += 50
+            elif enemy_damage > my_damage:
+                total_danger += 20
             else:
-                total_danger += 10
+                total_danger += 5
     
     return total_danger
 
@@ -936,8 +935,8 @@ def _choose_move_target(connections, danger_ids: set, current_region: dict,
                         my_damage: int, defense: int, weather: str,
                         enemy_memories: dict,
                         is_survival_mode: bool = False,
-                        is_post_heal: bool = False) -> str | None:
-    """Pilih target region dengan mempertimbangkan bahaya musuh dan blacklist"""
+                        is_post_heal: bool = False,
+                        is_early_game: bool = False) -> str | None:
     candidates = []
     item_regions = {i.get("regionId", "") for i in visible_items if isinstance(i, dict)}
     
@@ -969,14 +968,17 @@ def _choose_move_target(connections, danger_ids: set, current_region: dict,
             if _map_knowledge.get("revealed") and rid in _map_knowledge.get("safe_center", []):
                 score += 5
             
+            # Jika early game, cari item (tambah score)
+            if is_early_game and rid in item_regions:
+                score += 15
+            
             # DANGER ASSESSMENT
             danger_score = _get_region_danger_score(conn, my_damage, defense, weather, enemy_memories)
             if danger_score >= 500:
-                score -= 1000  # BLACKLISTED - JANGAN PERNAH MASUK!
+                score -= 1000
                 log.debug("Region %s has BLACKLISTED enemy! AVOIDING!", rid)
             elif danger_score >= 100:
                 score -= 200
-                log.debug("Region %s has DANGEROUS enemies! Avoiding.", rid)
             elif danger_score >= 50:
                 score -= 100
             elif danger_score > 0 and (is_survival_mode or is_post_heal):
@@ -1146,7 +1148,6 @@ def get_adaptive_strategy_vs(enemy_id: str, my_hp: int, my_damage: int) -> str:
     
     memory = _enemy_memories[enemy_id]
     
-    # BLACKLIST OVERRIDE
     if memory.is_blacklisted:
         return "flee_recommended"
     
@@ -1170,7 +1171,7 @@ def get_global_adaptation() -> dict:
     }
     
     if _global_meta_analysis["common_losing_strategies"].get("aggressive", 0) > 5:
-        adaptation["adjust_thresholds"]["MIN_HP_TO_ATTACK"] = 60
+        adaptation["adjust_thresholds"]["MIN_HP_TO_ATTACK"] = 50
         adaptation["priority_changes"].append("more_careful")
         log.info("🔄 GLOBAL ADAPTATION: Being more careful")
     
@@ -1200,14 +1201,11 @@ def on_defeated_by_enemy(enemy: dict, combat_summary: dict):
     
     if my_hp_final < 20 and enemy_hp_final > 50:
         reasons.append("got_outdamaged_significantly")
-        # Auto blacklist jika kalah telak
-        memory.is_blacklisted = True
-        memory.blacklist_reason = "decisive_loss"
+        if memory.estimated_damage >= BERSERKER_CONFIG["BLACKLIST_DAMAGE_THRESHOLD"]:
+            memory.is_blacklisted = True
+            memory.blacklist_reason = "decisive_loss"
     elif my_hp_final < 10 and enemy_hp_final < 30:
         reasons.append("close_fight_lost")
-    
-    my_strategy = combat_summary.get("my_strategy", "standard")
-    enemy_style = memory.primary_style
     
     log.error(f"💀 DEFEAT ANALYSIS vs {enemy_id[:8]}: {', '.join(reasons)}")
     
@@ -1224,7 +1222,6 @@ def get_special_counter(enemy_id: str) -> str | None:
         counter = _active_special_counters[enemy_id]
         return counter["strategy"]
     
-    # Cek blacklist
     if enemy_id in _enemy_memories and _enemy_memories[enemy_id].is_blacklisted:
         return "avoid_at_all_costs"
     
@@ -1276,7 +1273,7 @@ def print_learning_summary():
     report = get_learning_report()
     
     print("\n" + "="*60)
-    print("🧠 ADAPTIVE LEARNING SUMMARY v4.4")
+    print("🧠 ADAPTIVE LEARNING SUMMARY v4.5")
     print("="*60)
     print(f"Total enemies learned: {report['total_enemies_learned']}")
     print(f"Blacklisted enemies: {len(report['blacklisted_enemies'])}")
@@ -1312,7 +1309,6 @@ def reset_game_state():
     _post_heal_safe_turns = 0
     
     # NOTE: _enemy_memories TIDAK direset! Biarkan persist untuk blacklist!
-    # Tapi reset meta analysis
     _global_meta_analysis = {
         "most_dangerous_enemy": None,
         "highest_winrate_enemy": None,
@@ -1331,13 +1327,13 @@ def reset_game_state():
     }
     
     log.info("=" * 65)
-    log.info("  BERSERKER BRAIN v4.4 — BLACKLIST SYSTEM ACTIVE!")
+    log.info("  BERSERKER BRAIN v4.5 — BALANCED AGGRESSION!")
     log.info(f"  Persistent memory: {len(_enemy_memories)} enemies remembered")
     log.info("=" * 65)
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  MAIN DECISION ENGINE v4.4
+#  MAIN DECISION ENGINE v4.5 (BALANCED)
 # ═══════════════════════════════════════════════════════════════════
 
 def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict | None:
@@ -1384,7 +1380,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     region_terrain    = region.get("terrain", "").lower() if isinstance(region, dict) else ""
     region_weather    = region.get("weather", "").lower() if isinstance(region, dict) else ""
 
-    # Decrement post-heal safe turns
     if _post_heal_safe_turns > 0:
         _post_heal_safe_turns -= 1
         log.debug(f"Post-heal safe mode: {_post_heal_safe_turns} turns remaining")
@@ -1437,7 +1432,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         default=0
     )
     
-    # Cek blacklist untuk musuh di region
     has_blacklisted_enemy = False
     for e in enemies_here:
         eid = e.get("id", "")
@@ -1451,7 +1445,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     
     has_guardian = len(guardians_here) > 0
 
-    # COMBAT TRACKING MANAGEMENT
+    # COMBAT TRACKING
     if enemies_here and not _current_combat_state["in_combat"]:
         enemy = enemies_here[0]
         start_combat_tracking(
@@ -1477,22 +1471,17 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             return {"action": "move", "data": {"regionId": safe}, 
                     "reason": "BLACKLIST: Enemy is blacklisted!"}
 
-    # EARLY GAME: FARMING FIRST
+    # EARLY GAME: FARMING (tapi lebih singkat)
     if is_early_game:
         log.info("🌱 EARLY GAME FARMING MODE (Turn %d/%d)", current_turn, BERSERKER_CONFIG["FARM_TURNS_BEFORE_FIGHT"])
         
-        if enemies_here:
-            if has_blacklisted_enemy or strongest_enemy_damage > my_damage * 1.5:
-                safe = _find_safe_region(connections, danger_ids, view)
-                if safe and ep >= move_ep_cost:
-                    log.warning("🏃 EARLY GAME: Avoiding enemy, moving to %s", safe)
-                    return {"action": "move", "data": {"regionId": safe}, "reason": "EARLY: Avoid danger"}
-        
+        # Prioritaskan pickup item
         pickup_action = _smart_pickup(visible_items, inventory, region_id, equipped)
         if pickup_action:
             return pickup_action
         
-        if monsters and hp > 60 and ep >= 1:
+        # Farm monster jika ada dan aman
+        if monsters and hp > 40 and ep >= 1:
             target = _select_weakest(monsters)
             w_range = get_weapon_range(equipped)
             if _is_in_range(target, region_id, w_range, connections):
@@ -1521,7 +1510,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         heal = _find_healing_item(inventory, critical=True)
         if heal:
             log.warning("🚨 CRITICAL HEAL! HP=%d -> %s", hp, heal.get("typeId", "heal"))
-            # Record heal turn
             global _last_heal_turn
             _last_heal_turn = current_turn
             _post_heal_safe_turns = BERSERKER_CONFIG["SAFE_TURNS_AFTER_HEAL"]
@@ -1538,11 +1526,10 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         if result:
             return result
 
-    # FLEE LOGIC - LEBIH SENSITIF TERHADAP MUSUH KUAT
+    # FLEE LOGIC - LEBIH BERANI
     should_flee = False
     flee_reason = ""
 
-    # POST-HEAL: JANGAN MELAWAN!
     if is_post_heal:
         if enemies_here:
             should_flee = True
@@ -1568,19 +1555,18 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             log.warning("🏃 FLEEING! %s -> %s", flee_reason, safe)
             return {"action": "move", "data": {"regionId": safe}, "reason": f"FLEE: {flee_reason}"}
 
-    # COUNTER ATTACK - HANYA JIKA MUSUH TIDAK BLACKLISTED
+    # COUNTER ATTACK
     if just_attacked and _last_attacked_by and hp >= BERSERKER_CONFIG["COUNTER_ATTACK_HP"] and not is_post_heal:
         attacker = next((e for e in enemies_here if e.get("id") == _last_attacked_by), None)
         if attacker:
             attacker_id = _last_attacked_by
-            # Jangan counter blacklisted enemy
             if attacker_id in _enemy_memories and _enemy_memories[attacker_id].is_blacklisted:
                 log.warning("⚠️ Attacker is BLACKLISTED! NOT countering!")
             else:
                 attacker_damage = calc_damage(attacker.get("atk", 10), 
                                               _estimate_enemy_weapon_bonus(attacker), 
                                               defense, region_weather)
-                if attacker_damage <= my_damage * 2 and hp > attacker_damage * 2:
+                if attacker_damage <= my_damage * 2.5 and hp > attacker_damage * 1.5:
                     log.warning("⚔️ COUNTER ATTACK! vs %s (hp=%d) MyHP=%d", 
                                _last_attacked_by[:8], attacker.get("hp", 0), hp)
                     return {"action": "attack",
@@ -1588,7 +1574,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                             "reason": f"COUNTER: vs {_last_attacked_by[:8]}"}
 
     # PRE-FIGHT HEAL
-    if enemies_here and strongest_enemy_damage > 10 and hp < 50 and not is_post_heal:
+    if enemies_here and strongest_enemy_damage > 10 and hp < 45 and not is_post_heal:
         heal = _find_healing_item(inventory, critical=False)
         if heal:
             log.info("💊 PRE-FIGHT HEAL: HP=%d, enemy_dmg=%d", hp, strongest_enemy_damage)
@@ -1600,10 +1586,9 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     if equip_action:
         return equip_action
 
-    # COMBAT - JANGAN ATTACK JIKA MUSUH BLACKLISTED ATAU POST-HEAL
+    # COMBAT - LEBIH AGGRESIF
     can_attack = (hp >= BERSERKER_CONFIG["MIN_HP_TO_ATTACK"]
                   and ep_ratio >= BERSERKER_CONFIG["EP_ATTACK_MIN_RATIO"]
-                  and not is_survival_mode
                   and not is_post_heal
                   and not has_blacklisted_enemy)
 
@@ -1626,6 +1611,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         else:
             can_attack = True
 
+    # SERANG MUSUH!
     if enemies_here and can_attack:
         target = select_target_with_priority(enemies_here, "standard")
 
@@ -1643,14 +1629,24 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                 return {"action": "attack",
                         "data": {"targetId": target["id"], "targetType": "agent"},
                         "reason": f"ATTACK: target_hp={enemy_hp}"}
+    
+    # SERANG MONSTER (AGGRESIF)
+    if monsters and not enemies_here and hp > 35 and ep >= 1 and not is_post_heal:
+        target = _select_weakest(monsters)
+        w_range = get_weapon_range(equipped)
+        if _is_in_range(target, region_id, w_range, connections):
+            log.info("🐾 MONSTER FARM: HP=%d", target.get("hp", 0))
+            return {"action": "attack",
+                    "data": {"targetId": target["id"], "targetType": "monster"},
+                    "reason": f"MONSTER FARM: HP={target.get('hp','?')}"}
 
-    # GUARDIAN FARMING (skip if post-heal or blacklisted)
+    # GUARDIAN FARMING
     guardians_all = [a for a in visible_agents
                      if a.get("isGuardian", False) and a.get("isAlive", True)]
     
     guardian_farm_ok = (hp >= BERSERKER_CONFIG["MIN_HP_TO_ATTACK_GUARDIAN"] 
                         and ep >= 2 
-                        and my_damage >= 12
+                        and my_damage >= 10
                         and not _hunting_target
                         and not is_survival_mode
                         and not is_post_heal)
@@ -1677,7 +1673,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     if not can_act:
         return None
 
-    # FACILITY INTERACTION (prioritas tinggi jika perlu heal)
+    # FACILITY INTERACTION
     if not enemies_here and not guardians_here and (hp < 70 or is_survival_mode):
         facility = _select_facility_with_limit(interactables, hp, ep, current_turn, region_id)
         if facility:
@@ -1705,39 +1701,51 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             log.info("😴 REST: EP=%d/%d (%.0f%%)", ep, max_ep, ep_ratio * 100)
             return {"action": "rest", "data": {}, "reason": f"REST: EP={ep}/{max_ep}"}
 
-    # MONSTER FARMING (skip if post-heal)
-    if monsters and ep >= 1 and hp > 55 and not enemies_here and not _hunting_target and not is_survival_mode and not is_post_heal:
-        target = _select_weakest(monsters)
-        w_range = get_weapon_range(equipped)
-        if _is_in_range(target, region_id, w_range, connections):
-            log.info("🐾 MONSTER FARM: HP=%d", target.get("hp", 0))
-            return {"action": "attack",
-                    "data": {"targetId": target["id"], "targetType": "monster"},
-                    "reason": f"MONSTER FARM: HP={target.get('hp','?')}"}
-
-    # MOVEMENT - PRIORITASKAN SAFE REGION
+    # MOVEMENT - CARI MUSUH ATAU SAFE REGION
     if ep >= move_ep_cost and connections:
-        # Hanya pursuit jika target tidak blacklisted dan post-heal
-        if not is_survival_mode and not is_early_game and not is_post_heal:
-            if _hunting_target and BERSERKER_CONFIG["PURSUIT_ENABLED"] and hp >= BERSERKER_CONFIG["PURSUIT_MIN_HP"]:
-                target_id = _hunting_target.get("id", "")
-                is_target_dangerous = False
-                if target_id in _enemy_memories:
-                    mem = _enemy_memories[target_id]
-                    is_target_dangerous = mem.is_blacklisted or mem.is_dangerous(my_damage)
-                
-                if not is_target_dangerous:
-                    target_region = _hunting_target.get("regionId", "")
-                    if target_region and target_region != region_id and target_region not in danger_ids:
-                        log.info("🎯 PURSUIT: Chase %s to %s", _hunting_target.get("id", "?")[:8], target_region)
+        # Cari musuh terdekat jika HP cukup
+        visible_enemies_elsewhere = [a for a in visible_agents 
+                                     if a.get("id") != my_id 
+                                     and a.get("regionId") != region_id
+                                     and not a.get("isGuardian", False)]
+        
+        if visible_enemies_elsewhere and hp > 50 and not is_post_heal and not is_survival_mode:
+            # Cek apakah musuh itu berbahaya
+            target_enemy = visible_enemies_elsewhere[0]
+            target_id = target_enemy.get("id", "")
+            if target_id in _enemy_memories:
+                if not _enemy_memories[target_id].is_blacklisted:
+                    target_region = target_enemy.get("regionId")
+                    if target_region and target_region not in danger_ids:
+                        log.info("🎯 MOVING TOWARD ENEMY: %s", target_region)
                         return {"action": "move", "data": {"regionId": target_region},
-                                "reason": "PURSUIT: Chase target"}
+                                "reason": "SEEK ENEMY"}
+            else:
+                target_region = target_enemy.get("regionId")
+                if target_region and target_region not in danger_ids:
+                    log.info("🎯 MOVING TOWARD ENEMY: %s", target_region)
+                    return {"action": "move", "data": {"regionId": target_region},
+                            "reason": "SEEK ENEMY"}
+        
+        # Pursuit target hunting
+        if _hunting_target and BERSERKER_CONFIG["PURSUIT_ENABLED"] and hp >= BERSERKER_CONFIG["PURSUIT_MIN_HP"] and not is_post_heal:
+            target_id = _hunting_target.get("id", "")
+            is_target_dangerous = False
+            if target_id in _enemy_memories:
+                mem = _enemy_memories[target_id]
+                is_target_dangerous = mem.is_blacklisted
+            if not is_target_dangerous:
+                target_region = _hunting_target.get("regionId", "")
+                if target_region and target_region != region_id and target_region not in danger_ids:
+                    log.info("🎯 PURSUIT: Chase %s to %s", _hunting_target.get("id", "?")[:8], target_region)
+                    return {"action": "move", "data": {"regionId": target_region},
+                            "reason": "PURSUIT: Chase target"}
 
         move_target = _choose_move_target(connections, danger_ids,
                                           region, visible_items, alive_count,
                                           my_damage, defense, region_weather,
                                           _enemy_memories,
-                                          is_survival_mode, is_post_heal)
+                                          is_survival_mode, is_post_heal, is_early_game)
         if move_target:
             log.info("🚶 MOVE: Strategic to %s", move_target)
             return {"action": "move", "data": {"regionId": move_target},
@@ -1762,7 +1770,7 @@ def on_attacked_by(attacker_id: str, current_turn: int, damage: int = None):
     if damage and attacker_id:
         memory = get_or_create_memory(attacker_id)
         memory.record_real_damage(damage)
-        log.warning("⚠️ ATTACKED BY: %s for %d damage (recorded)", attacker_id[:8], damage)
+        log.warning("⚠️ ATTACKED BY: %s for %d damage", attacker_id[:8], damage)
 
 
 def on_enemy_killed(enemy_id: str):
@@ -1777,12 +1785,10 @@ def on_we_died(killer_id: str, combat_summary: dict = None):
     on_killed_by_enemy(killer_id)
     if combat_summary:
         on_defeated_by_enemy({"id": killer_id}, combat_summary)
-    # Reset game state TAPI preserve enemy memories (sudah di reset_game_state)
     reset_game_state()
 
 
 def on_heal_used(item_type: str, current_turn: int):
-    """Hook saat bot menggunakan healing item"""
     global _last_heal_turn, _post_heal_safe_turns
     _last_heal_turn = current_turn
     _post_heal_safe_turns = BERSERKER_CONFIG["SAFE_TURNS_AFTER_HEAL"]
@@ -1811,7 +1817,6 @@ def get_all_enemy_intel() -> list:
 
 
 def get_blacklist() -> list:
-    """Dapatkan daftar musuh yang diblacklist"""
     return [
         {
             "id": mem.id[:8],
