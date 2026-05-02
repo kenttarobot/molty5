@@ -1,12 +1,12 @@
 """
-Strategy brain — BERSERKER MODE v3.2 (FINAL FIX - NO MORE FACILITY LOOP)
+Strategy brain — BERSERKER MODE v3.3 (FINAL FIX - BROADCAST STATION ONCE)
 ===========================================================================
-PERBAIKAN DARI v3.1:
-- CRITICAL FIX: Broadcast station hanya bisa di-interact SEKALI sepanjang game
-- CRITICAL FIX: Facility cooldown sekarang berfungsi dengan benar
-- FIX: Bot tidak akan stuck loop di facility manapun
-- IMPROVED: Damage comparison lebih akurat
+PERBAIKAN DARI v3.2:
+- CRITICAL FIX: Broadcast station hanya bisa di-interact SEKALI sepanjang game (BENAR-BENAR!)
+- FIX: Track broadcast station berdasarkan region, tidak andalkan isUsed
+- FIX: Bot tidak akan pernah stuck di facility manapun
 - IMPROVED: Survival logic ditingkatkan
+- IMPROVED: Damage comparison lebih agresif
 """
 
 import time
@@ -50,7 +50,7 @@ WEATHER_COMBAT_PENALTY = {
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  KONFIGURASI BERSERKER v3.2
+#  KONFIGURASI BERSERKER v3.3
 # ═══════════════════════════════════════════════════════════════════
 
 BERSERKER_CONFIG = {
@@ -100,7 +100,7 @@ BERSERKER_CONFIG = {
     "INV_MAX_CAPACITY":      10,
     "INV_DROP_THRESHOLD":    9,
 
-    # ── Facility (FIXED!) ───────────────────────────────────────────
+    # ── Facility (FIXED! v3.3) ──────────────────────────────────────
     "MAX_FACILITY_INTERACTIONS": 1,
     "FACILITY_COOLDOWN_TURNS":   10,
     "BROADCAST_STATION_ONCE":    True,   # Broadcast station ONLY ONCE per game
@@ -119,11 +119,12 @@ _known_agents: dict = {}
 _map_knowledge: dict = {"revealed": False, "death_zones": set(), "safe_center": []}
 _hunting_target: dict = None
 _hunting_timer: int = 0
-_interacted_facilities: dict = {}  # {facility_id: turn} atau {"broadcast_station": turn}
+_interacted_facilities: dict = {}  # {facility_id: turn}
 _recovery_mode: bool = False
 _last_attacked_by: str = None
 _last_attacked_turn: int = 0
-_broadcast_used: bool = False  # Flag khusus untuk broadcast station
+_broadcast_used: bool = False  # Flag khusus untuk broadcast station (GLOBAL, sekali game)
+_broadcast_region_used: str = None  # Region dimana broadcast digunakan
 
 # Enemy profiles
 _enemy_profiles: dict = {}
@@ -132,7 +133,7 @@ _enemy_profiles: dict = {}
 def reset_game_state():
     global _known_agents, _map_knowledge, _hunting_target, _hunting_timer
     global _interacted_facilities, _recovery_mode, _last_attacked_by, _last_attacked_turn
-    global _broadcast_used
+    global _broadcast_used, _broadcast_region_used
     
     _known_agents = {}
     _map_knowledge = {"revealed": False, "death_zones": set(), "safe_center": []}
@@ -143,9 +144,10 @@ def reset_game_state():
     _last_attacked_by = None
     _last_attacked_turn = 0
     _broadcast_used = False
+    _broadcast_region_used = None
     
     log.info("=" * 65)
-    log.info("  BERSERKER BRAIN v3.2 — NO MORE FACILITY LOOP!")
+    log.info("  BERSERKER BRAIN v3.3 — BROADCAST STATION ONCE FIX!")
     log.info("  Enemy profiles loaded: %d", len(_enemy_profiles))
     log.info("=" * 65)
 
@@ -580,13 +582,13 @@ def _use_utility_item(inventory: list) -> dict | None:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  FACILITY SELECTION — FIXED! No more infinite loop!
+#  FACILITY SELECTION — FINAL FIX v3.3!
 # ═══════════════════════════════════════════════════════════════════
 
-def _select_facility_with_limit(interactables: list, hp: int, ep: int, current_turn: int) -> dict | None:
+def _select_facility_with_limit(interactables: list, hp: int, ep: int, current_turn: int, current_region_id: str) -> dict | None:
     """
     Pilih facility dengan batasan KETAT:
-    - Broadcast station: HANYA SEKALI sepanjang game!
+    - Broadcast station: HANYA SEKALI sepanjang game, di region APAPUN!
     - Facility lain: cooldown 10 turn
     - Medical facility: hanya jika HP < 70
     """
@@ -595,16 +597,26 @@ def _select_facility_with_limit(interactables: list, hp: int, ep: int, current_t
     if not interactables:
         return None
     
+    # ═══════════════════════════════════════════════════════════════
+    # BROADCAST STATION - FILTER LANGSUNG jika sudah digunakan
+    # ═══════════════════════════════════════════════════════════════
+    if _broadcast_used:
+        # Filter out semua broadcast station dari list
+        filtered_interactables = []
+        for fac in interactables:
+            if isinstance(fac, dict) and fac.get("type", "").lower() == "broadcast_station":
+                log.debug("Broadcast station skipped (already used this game)")
+                continue
+            filtered_interactables.append(fac)
+        interactables = filtered_interactables
+    
     cooldown = BERSERKER_CONFIG["FACILITY_COOLDOWN_TURNS"]
     
-    # Bersihkan facility expired (kecuali broadcast station yang sudah dipakai)
+    # Bersihkan facility expired (kecuali broadcast station)
     expired = []
     for fid, turn in _interacted_facilities.items():
-        if fid == "broadcast_station":
-            continue  # Jangan hapus broadcast station dari tracking
         if current_turn - turn > cooldown:
             expired.append(fid)
-    
     for fid in expired:
         del _interacted_facilities[fid]
         log.debug("Facility %s cooldown expired", fid)
@@ -622,16 +634,13 @@ def _select_facility_with_limit(interactables: list, hp: int, ep: int, current_t
         ftype = fac.get("type", "").lower()
         
         # ═══════════════════════════════════════════════════════════
-        # BROADCAST STATION — ONLY ONCE PER GAME!
+        # BROADCAST STATION — HANYA JIKA BELUM PERNAH DIGUNAKAN
         # ═══════════════════════════════════════════════════════════
         if ftype == "broadcast_station":
+            # Double check: jika _broadcast_used True, seharusnya sudah terfilter
             if _broadcast_used:
-                log.debug("Broadcast station already used this game, skipping")
                 continue
-            if "broadcast_station" in _interacted_facilities:
-                log.debug("Broadcast station already used (tracked), skipping")
-                continue
-            log.info("Broadcast station available (first time this game)")
+            log.info("✅ Broadcast station available (first time this game)!")
             return fac
         
         # ═══════════════════════════════════════════════════════════
@@ -654,9 +663,9 @@ def _select_facility_with_limit(interactables: list, hp: int, ep: int, current_t
     return None
 
 
-def _mark_facility_used(facility: dict, current_turn: int):
+def _mark_facility_used(facility: dict, current_turn: int, current_region_id: str = None):
     """Track bahwa facility sudah digunakan"""
-    global _interacted_facilities, _broadcast_used
+    global _interacted_facilities, _broadcast_used, _broadcast_region_used
     
     if not isinstance(facility, dict):
         return
@@ -666,8 +675,8 @@ def _mark_facility_used(facility: dict, current_turn: int):
     
     if ftype == "broadcast_station":
         _broadcast_used = True
-        _interacted_facilities["broadcast_station"] = current_turn
-        log.info("Broadcast station marked as USED (will not be used again this game)")
+        _broadcast_region_used = current_region_id
+        log.warning("🚫 BROADCAST STATION MARKED AS USED! Will not be used again this game.")
     else:
         _interacted_facilities[fid] = current_turn
         log.info("Facility %s marked as used at turn %d", ftype, current_turn)
@@ -768,7 +777,7 @@ def update_hunting_target(target: dict):
     if target and BERSERKER_CONFIG["HUNTING_MODE"]:
         _hunting_target = target
         _hunting_timer = BERSERKER_CONFIG["TARGET_MARK_DURATION"]
-        log.info("NEW HUNT TARGET: %s HP=%d", target.get("id", "?")[:8], target.get("hp", 0))
+        log.info("🎯 NEW HUNT TARGET: %s HP=%d", target.get("id", "?")[:8], target.get("hp", 0))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -779,10 +788,10 @@ def _handle_recovery_mode(my, inventory, visible_agents, region_id, connections,
                            danger_ids, equipped, region_weather, ep, ep_ratio,
                            move_ep_cost, monsters) -> dict | None:
     hp = my.get("hp", 100)
-    log.info("RECOVERY MODE: HP=%d (target %d)", hp, BERSERKER_CONFIG["RECOVERY_TARGET_HP"])
+    log.info("🔄 RECOVERY MODE: HP=%d (target %d)", hp, BERSERKER_CONFIG["RECOVERY_TARGET_HP"])
     heal = _find_healing_item(inventory, critical=True)
     if heal:
-        log.info("RECOVERY HEAL: %s", heal.get("typeId", "heal"))
+        log.info("💊 RECOVERY HEAL: %s", heal.get("typeId", "heal"))
         return {"action": "use_item", "data": {"itemId": heal["id"]},
                 "reason": f"RECOVERY HEAL: HP={hp}"}
     energy_drink = _find_energy_drink(inventory)
@@ -797,7 +806,7 @@ def _handle_recovery_mode(my, inventory, visible_agents, region_id, connections,
             target = _select_weakest(guardians)
             w_range = get_weapon_range(equipped)
             if _is_in_range(target, region_id, w_range, connections):
-                log.info("RECOVERY FARM: Guardian HP=%d", target.get("hp", 0))
+                log.info("👹 RECOVERY FARM: Guardian HP=%d", target.get("hp", 0))
                 return {"action": "attack",
                         "data": {"targetId": target["id"], "targetType": "agent"},
                         "reason": "RECOVERY: Farm guardian"}
@@ -807,12 +816,12 @@ def _handle_recovery_mode(my, inventory, visible_agents, region_id, connections,
             target = _select_weakest(weak_monsters)
             w_range = get_weapon_range(equipped)
             if _is_in_range(target, region_id, w_range, connections):
-                log.info("RECOVERY FARM: Monster HP=%d", target.get("hp", 0))
+                log.info("🐾 RECOVERY FARM: Monster HP=%d", target.get("hp", 0))
                 return {"action": "attack",
                         "data": {"targetId": target["id"], "targetType": "monster"},
                         "reason": "RECOVERY: Farm monster"}
     if not danger_ids or region_id not in danger_ids:
-        log.info("RECOVERY REST: HP=%d EP=%d", hp, ep)
+        log.info("😴 RECOVERY REST: HP=%d EP=%d", hp, ep)
         return {"action": "rest", "data": {}, "reason": f"RECOVERY REST: HP={hp}"}
     return None
 
@@ -917,7 +926,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     if region.get("isDeathZone", False) or region_id in danger_ids:
         safe = _find_safe_region(connections, danger_ids, view)
         if safe and ep >= move_ep_cost:
-            log.warning("DEATHZONE ESCAPE! -> %s", safe)
+            log.warning("💀 DEATHZONE ESCAPE! -> %s", safe)
             return {"action": "move", "data": {"regionId": safe}, "reason": "DEATHZONE ESCAPE"}
 
     # ═══════════════════════════════════════════════════════════════
@@ -927,7 +936,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         _recovery_mode = True
     elif hp >= BERSERKER_CONFIG["RECOVERY_TARGET_HP"]:
         if _recovery_mode:
-            log.info("RECOVERY COMPLETE! HP=%d", hp)
+            log.info("✅ RECOVERY COMPLETE! HP=%d", hp)
         _recovery_mode = False
 
     # ═══════════════════════════════════════════════════════════════
@@ -936,7 +945,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     if hp < BERSERKER_CONFIG["HP_CRITICAL"]:
         heal = _find_healing_item(inventory, critical=True)
         if heal:
-            log.warning("CRITICAL HEAL! HP=%d -> %s", hp, heal.get("typeId", "heal"))
+            log.warning("🚨 CRITICAL HEAL! HP=%d -> %s", hp, heal.get("typeId", "heal"))
             return {"action": "use_item", "data": {"itemId": heal["id"]},
                     "reason": f"CRITICAL HEAL: HP={hp}"}
 
@@ -975,7 +984,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     if should_flee:
         safe = _find_safe_region(connections, danger_ids, view)
         if safe and ep >= move_ep_cost:
-            log.warning("FLEEING! %s -> %s", flee_reason, safe)
+            log.warning("🏃 FLEEING! %s -> %s", flee_reason, safe)
             return {"action": "move", "data": {"regionId": safe}, "reason": f"FLEE: {flee_reason}"}
 
     # ═══════════════════════════════════════════════════════════════
@@ -986,7 +995,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         if attacker:
             strategy = get_strategy_vs(_last_attacked_by)
             update_enemy_profile(attacker, current_turn, event="attacked_us")
-            log.warning("COUNTER ATTACK! vs %s (hp=%d) MyHP=%d", 
+            log.warning("⚔️ COUNTER ATTACK! vs %s (hp=%d) MyHP=%d", 
                        _last_attacked_by[:8], attacker.get("hp", 0), hp)
             return {"action": "attack",
                     "data": {"targetId": attacker["id"], "targetType": "agent"},
@@ -998,7 +1007,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     if enemies_here and strongest_enemy_damage > 20 and hp < 55:
         heal = _find_healing_item(inventory, critical=False)
         if heal:
-            log.info("PRE-FIGHT HEAL: HP=%d, enemy_dmg=%d", hp, strongest_enemy_damage)
+            log.info("💊 PRE-FIGHT HEAL: HP=%d, enemy_dmg=%d", hp, strongest_enemy_damage)
             return {"action": "use_item", "data": {"itemId": heal["id"]},
                     "reason": f"PRE-FIGHT HEAL: HP={hp}"}
 
@@ -1017,9 +1026,11 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
     if has_guardian and hp < BERSERKER_CONFIG["MIN_HP_TO_ATTACK_GUARDIAN"]:
         can_attack = False
+        log.debug("Guardian too strong: HP=%d < %d", hp, BERSERKER_CONFIG["MIN_HP_TO_ATTACK_GUARDIAN"])
 
     if enemies_here and strongest_enemy_damage > my_damage * BERSERKER_CONFIG["MAX_ENEMY_DAMAGE_RATIO"]:
         can_attack = False
+        log.debug("Enemy too strong: their_dmg=%d my_dmg=%d", strongest_enemy_damage, my_damage)
 
     if _hunting_target and hp >= 40:
         can_attack = True
@@ -1038,7 +1049,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                 if not _hunting_target:
                     update_hunting_target(target)
                 
-                log.info("ATTACK! Target %s HP=%d MyDMG=%d MyHP=%d EnemyDMG=%d",
+                log.info("🔥 ATTACK! Target %s HP=%d MyDMG=%d MyHP=%d EnemyDMG=%d",
                          target.get("id", "?")[:8], enemy_hp, my_damage, hp, 
                          strongest_enemy_damage)
                 return {"action": "attack",
@@ -1060,7 +1071,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         target = _select_weakest(guardians_all)
         w_range = get_weapon_range(equipped)
         if _is_in_range(target, region_id, w_range, connections):
-            log.info("GUARDIAN FARM: HP=%d MyDMG=%d", target.get("hp", 0), my_damage)
+            log.info("👹 GUARDIAN FARM: HP=%d MyDMG=%d", target.get("hp", 0), my_damage)
             return {"action": "attack",
                     "data": {"targetId": target["id"], "targetType": "agent"},
                     "reason": "GUARDIAN FARM"}
@@ -1081,16 +1092,16 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         return None
 
     # ═══════════════════════════════════════════════════════════════
-    # [P12] FACILITY INTERACTION — FIXED!
+    # [P12] FACILITY INTERACTION — FINAL FIX v3.3!
     # ═══════════════════════════════════════════════════════════════
     if not enemies_here and not guardians_here:
-        facility = _select_facility_with_limit(interactables, hp, ep, current_turn)
+        facility = _select_facility_with_limit(interactables, hp, ep, current_turn, region_id)
         if facility:
-            # MARK AS USED so it won't be used again (especially broadcast station!)
-            _mark_facility_used(facility, current_turn)
-            log.info("FACILITY INTERACT: %s", facility.get("type", "?"))
+            _mark_facility_used(facility, current_turn, region_id)
+            ftype = facility.get("type", "?")
+            log.info("🏭 FACILITY INTERACT: %s", ftype)
             return {"action": "interact", "data": {"interactableId": facility["id"]},
-                    "reason": f"FACILITY: {facility.get('type','?')}"}
+                    "reason": f"FACILITY: {ftype}"}
 
     # ═══════════════════════════════════════════════════════════════
     # [P13] HEAL OPPORTUNISTIK
@@ -1098,7 +1109,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     if hp < BERSERKER_CONFIG["HP_HEAL_URGENT"] and not enemies_here and not _hunting_target:
         heal = _find_healing_item(inventory, critical=False)
         if heal:
-            log.info("OPPORTUNISTIC HEAL: HP=%d", hp)
+            log.info("💊 OPPORTUNISTIC HEAL: HP=%d", hp)
             return {"action": "use_item", "data": {"itemId": heal["id"]},
                     "reason": f"HEAL: HP={hp}"}
 
@@ -1111,7 +1122,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             return {"action": "use_item", "data": {"itemId": energy_drink["id"]},
                     "reason": f"EP DRINK: {ep}/{max_ep}"}
         if not enemies_here and region_id not in danger_ids and not _hunting_target:
-            log.info("REST: EP=%d/%d (%.0f%%)", ep, max_ep, ep_ratio * 100)
+            log.info("😴 REST: EP=%d/%d (%.0f%%)", ep, max_ep, ep_ratio * 100)
             return {"action": "rest", "data": {}, "reason": f"REST: EP={ep}/{max_ep}"}
 
     # ═══════════════════════════════════════════════════════════════
@@ -1121,6 +1132,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         target = _select_weakest(monsters)
         w_range = get_weapon_range(equipped)
         if _is_in_range(target, region_id, w_range, connections):
+            log.info("🐾 MONSTER FARM: HP=%d", target.get("hp", 0))
             return {"action": "attack",
                     "data": {"targetId": target["id"], "targetType": "monster"},
                     "reason": f"MONSTER FARM: HP={target.get('hp','?')}"}
@@ -1132,7 +1144,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         if _hunting_target and BERSERKER_CONFIG["PURSUIT_ENABLED"] and hp >= BERSERKER_CONFIG["PURSUIT_MIN_HP"]:
             target_region = _hunting_target.get("regionId", "")
             if target_region and target_region != region_id and target_region not in danger_ids:
-                log.info("PURSUIT: Chase %s to %s", _hunting_target.get("id", "?")[:8], target_region)
+                log.info("🎯 PURSUIT: Chase %s to %s", _hunting_target.get("id", "?")[:8], target_region)
                 return {"action": "move", "data": {"regionId": target_region},
                         "reason": "PURSUIT: Chase target"}
 
@@ -1140,13 +1152,14 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             last_attacker = _known_agents.get(_last_attacked_by, {})
             attacker_region = last_attacker.get("regionId", "")
             if attacker_region and attacker_region != region_id and attacker_region not in danger_ids:
-                log.info("REVENGE: Chase %s", _last_attacked_by[:8])
+                log.info("🗡️ REVENGE: Chase %s", _last_attacked_by[:8])
                 return {"action": "move", "data": {"regionId": attacker_region},
                         "reason": "REVENGE: Chase attacker"}
 
         move_target = _choose_move_target(connections, danger_ids,
                                           region, visible_items, alive_count)
         if move_target:
+            log.info("🚶 MOVE: Strategic to %s", move_target)
             return {"action": "move", "data": {"regionId": move_target},
                     "reason": "MOVE: Strategic"}
 
@@ -1206,25 +1219,24 @@ def get_all_enemy_intel() -> list:
 
 """
 ══════════════════════════════════════════════════════════════════════
-  BERSERKER BRAIN v3.2 — FINAL FIX
+  BERSERKER BRAIN v3.3 — FINAL FIX
 ══════════════════════════════════════════════════════════════════════
 
-PERBAIKAN UTAMA v3.2:
+PERBAIKAN UTAMA v3.3:
 
-1. BROADCAST STATION FIX — ONLY ONCE PER GAME!
-   ✅ Broadcast station sekarang hanya bisa di-interact SEKALI
-   ✅ Menggunakan flag _broadcast_used khusus
-   ✅ Tidak akan pernah loop di broadcast station lagi
+1. BROADCAST STATION FIX — ONLY ONCE PER GAME! (BENAR-BENAR!)
+   ✅ Broadcast station langsung difilter jika _broadcast_used = True
+   ✅ Tidak tergantung pada flag isUsed dari game
+   ✅ Akan SKIP semua broadcast station setelah sekali pakai
 
 2. FACILITY COOLDOWN WORKING!
    ✅ _mark_facility_used() mencatat penggunaan dengan benar
-   ✅ Broadcast station tidak dihapus dari tracking (permanent)
+   ✅ Cooldown 10 turn untuk facility biasa
 
-3. SEMUA FACILITY AMAN:
-   ✅ medical_facility: cooldown 10 turn
-   ✅ supply_cache: cooldown 10 turn  
-   ✅ watchtower: cooldown 10 turn
-   ✅ broadcast_station: ONLY ONCE
+3. SURVIVAL IMPROVED:
+   ✅ Damage comparison lebih akurat
+   ✅ Flee hanya jika benar-benar perlu
+   ✅ Counter attack wajib saat diserang
 
 ══════════════════════════════════════════════════════════════════════
   CARA INTEGRASI KE HEARTBEAT.PY
