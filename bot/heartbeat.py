@@ -317,10 +317,6 @@ class Heartbeat:
         """Run the WebSocket gameplay engine."""
         log.info("═══ PLAYING GAME: %s (type=%s) ═══", game_id, entry_type)
         
-        # ← TAMBAHKAN INI: reset state brain (tapi enemy profiles tetap tersimpan)
-        from bot.strategy import brain
-        brain.reset_game_state()
-
         # Feed dashboard — use SAME key as heartbeat so no duplicate card
         dashboard_state.update_agent(self._agent_key, {
             "status": "playing",
