@@ -803,7 +803,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     # LAST RESORT: REST
     # ═══════════════════════════════════════════════════════════════
     if ep < 4 and not enemies_here and not region.get("isDeathZone") and region_id not in danger_ids:
-        return {"action": "rest", "data": {},
+        return {"action": "rest", "data": {}},
               """
 ╔══════════════════════════════════════════════════════════════════╗
 ║        BERSERKER BRAIN v3.0 — TOURNAMENT DOMINATOR              ║
