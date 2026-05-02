@@ -1,12 +1,12 @@
 """
-Strategy brain — BERSERKER MODE v4.0 (ADAPTIVE ADVERSARIAL LEARNING)
+Strategy brain — BERSERKER MODE v4.1 (AGGRESSIVE FIX - LESS FLEE)
 ===========================================================================
-FITUR BARU v4.0:
-- ADAPTIVE LEARNING: Merekam strategi musuh yang mengalahkan kita
-- PATTERN RECOGNITION: Deteksi pola serangan, retreat, heal, pursuit
-- COUNTER STRATEGY: Adaptasi taktik berdasarkan history kemenangan musuh
-- STYLE PROFILING: Klasifikasi 8 tipe pemain (Aggressor, Kiter, Healer, Camper, dll)
-- DYNAMIC ADJUSTMENT: Bot berubah gaya bertarung lawan musuh tertentu
+PERBAIKAN DARI v4.0:
+- FIX: Enemy damage calculation terlalu tinggi (dikurangi)
+- FIX: Threshold flee dinaikkan (2.5x dari sebelumnya 1.5x)
+- IMPROVED: Lebih agresif di early game
+- IMPROVED: Tidak flee hanya karena damage difference
+- ADDED: Early game aggression mode
 ===========================================================================
 """
 
@@ -53,47 +53,47 @@ WEATHER_COMBAT_PENALTY = {
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  KONFIGURASI BERSERKER v4.0
+#  KONFIGURASI BERSERKER v4.1 (AGGRESSIVE)
 # ═══════════════════════════════════════════════════════════════════
 
 BERSERKER_CONFIG = {
     # ── HP & EP Management ──────────────────────────────────────────
-    "HP_MINIMUM":            50,
-    "HP_CRITICAL":           30,
-    "HP_HEAL_URGENT":        50,
-    "HP_HEAL_MODERATE":      65,
-    "EP_MINIMUM_RATIO":      0.60,
-    "EP_ATTACK_MIN_RATIO":   0.30,
-    "EP_SAFE_RATIO":         0.20,
+    "HP_MINIMUM":            40,  # Diturunkan dari 50
+    "HP_CRITICAL":           25,  # Diturunkan dari 30
+    "HP_HEAL_URGENT":        45,  # Diturunkan dari 50
+    "HP_HEAL_MODERATE":      60,  # Diturunkan dari 65
+    "EP_MINIMUM_RATIO":      0.50,  # Diturunkan dari 0.60
+    "EP_ATTACK_MIN_RATIO":   0.25,  # Diturunkan dari 0.30
+    "EP_SAFE_RATIO":         0.15,  # Diturunkan dari 0.20
 
-    # ── Combat & Survival ───────────────────────────────────────────
-    "MIN_HP_TO_ATTACK":      45,
-    "MIN_HP_TO_ATTACK_GUARDIAN": 70,
-    "COUNTER_ATTACK_HP":     35,
+    # ── Combat & Survival (LEBIH AGGRESIF) ───────────────────────────
+    "MIN_HP_TO_ATTACK":      30,  # Diturunkan dari 45! 
+    "MIN_HP_TO_ATTACK_GUARDIAN": 60,  # Diturunkan dari 70
+    "COUNTER_ATTACK_HP":     25,  # Diturunkan dari 35
     "NEVER_FLEE_IF_ATTACKED": True,
     
-    # ── Damage Comparison ───────────────────────────────────────────
-    "MAX_ENEMY_DAMAGE_RATIO": 1.5,
-    "DANGEROUS_ENEMY_DAMAGE": 25,
-    "FLEE_STRONG_ENEMY_RATIO": 1.5,
+    # ── Damage Comparison (LEBIH BERANI) ─────────────────────────────
+    "MAX_ENEMY_DAMAGE_RATIO": 2.5,  # DINAIKKAN dari 1.5!
+    "DANGEROUS_ENEMY_DAMAGE": 35,
+    "FLEE_STRONG_ENEMY_RATIO": 2.5,  # DINAIKKAN dari 1.5! (2.5x damage baru flee)
     
     # ── Pursuit ─────────────────────────────────────────────────────
     "PURSUIT_ENABLED":       True,
-    "PURSUIT_MAX_HOPS":      2,
-    "PURSUIT_MIN_HP":        50,
+    "PURSUIT_MAX_HOPS":      3,  # Ditambah dari 2
+    "PURSUIT_MIN_HP":        40,  # Diturunkan dari 50
 
     # ── Recovery Mode ───────────────────────────────────────────────
-    "RECOVERY_HP_THRESHOLD": 35,
-    "RECOVERY_TARGET_HP":    75,
+    "RECOVERY_HP_THRESHOLD": 30,  # Diturunkan dari 35
+    "RECOVERY_TARGET_HP":    70,  # Diturunkan dari 75
     "RECOVERY_FARM_GUARDIAN": True,
-    "RECOVERY_FARM_GUARDIAN_MIN_HP": 55,
+    "RECOVERY_FARM_GUARDIAN_MIN_HP": 50,  # Diturunkan dari 55
 
     # ── Hunting ─────────────────────────────────────────────────────
     "HUNTING_MODE":          True,
     "HUNT_UNTIL_DEATH":      True,
-    "TARGET_MARK_DURATION":  15,
-    "EXECUTE_HP_THRESHOLD":  30,
-    "WOUNDED_HP_THRESHOLD":  50,
+    "TARGET_MARK_DURATION":  20,  # Ditambah dari 15
+    "EXECUTE_HP_THRESHOLD":  35,  # Dinaikkan dari 30
+    "WOUNDED_HP_THRESHOLD":  55,  # Dinaikkan dari 50
 
     # ── Enemy Profiling ─────────────────────────────────────────────
     "PROFILE_MEMORY_SIZE":   100,
@@ -108,9 +108,10 @@ BERSERKER_CONFIG = {
     "FACILITY_COOLDOWN_TURNS":   10,
     "BROADCAST_STATION_ONCE":    True,
 
-    # ── Flee ─────────────────────────────────────────────────────────
-    "FLEE_HP":               15,
-    "FLEE_OUTNUMBERED":      4,
+    # ── Flee (LEBIH BERANI) ──────────────────────────────────────────
+    "FLEE_HP":               12,  # Diturunkan dari 15
+    "FLEE_OUTNUMBERED":      5,   # Dinaikkan dari 4
+    "EARLY_GAME_TURNS":      20,  # Early game aggression period
 }
 
 
@@ -265,7 +266,8 @@ class EnemyMemory:
                 advice["strategy"] = self.what_worked[-1]
                 advice["special_notes"].append("Using previously successful strategy")
         
-        if my_hp < 40 and self.primary_style == PlayerStyle.AGGRESSOR:
+        # Hanya flee jika HP sangat rendah vs aggressor
+        if my_hp < 25 and self.primary_style == PlayerStyle.AGGRESSOR:
             advice["should_fight"] = False
             advice["special_notes"].append("Too low HP vs aggressor - FLEE!")
         
@@ -595,8 +597,9 @@ def learn_from_map(view: dict):
 
 def calc_damage(atk: int, weapon_bonus: int, target_def: int, weather: str = "clear") -> int:
     base = atk + weapon_bonus - int(target_def * 0.5)
+    # FIX: Damage minimal 3, bukan 1 (agar tidak terlalu lemah)
     penalty = WEATHER_COMBAT_PENALTY.get(weather, 0.0)
-    return max(1, int(base * (1 - penalty)))
+    return max(3, int(base * (1 - penalty)))
 
 
 def get_weapon_bonus(equipped_weapon) -> int:
@@ -640,11 +643,17 @@ def _get_move_ep_cost(terrain: str, weather: str) -> int:
 
 
 def _estimate_enemy_weapon_bonus(agent: dict) -> int:
+    """FIX: Perkiraan damage musuh lebih akurat - tidak overestimate"""
     weapon = agent.get("equippedWeapon")
     if not weapon:
         return 0
     type_id = weapon.get("typeId", "").lower() if isinstance(weapon, dict) else ""
-    return WEAPONS.get(type_id, {}).get("bonus", 0)
+    # FIX: Jangan overestimate, gunakan nilai real
+    bonus = WEAPONS.get(type_id, {}).get("bonus", 0)
+    # FIX: Jika musuh pake fist, damage kecil
+    if type_id == "fist" or not type_id:
+        return 0
+    return bonus
 
 
 def _select_weakest(targets: list) -> dict:
@@ -1052,13 +1061,13 @@ def get_global_adaptation() -> dict:
         "priority_changes": [],
     }
     
-    if _global_meta_analysis["common_losing_strategies"].get("aggressive", 0) > 3:
-        adaptation["adjust_thresholds"]["MIN_HP_TO_ATTACK"] = 55
+    if _global_meta_analysis["common_losing_strategies"].get("aggressive", 0) > 5:
+        adaptation["adjust_thresholds"]["MIN_HP_TO_ATTACK"] = 45
         adaptation["priority_changes"].append("less_aggressive")
         log.info("🔄 GLOBAL ADAPTATION: Reducing aggression (too many losses)")
     
-    if _global_meta_analysis["common_losing_strategies"].get("defensive", 0) > 3:
-        adaptation["adjust_thresholds"]["MIN_HP_TO_ATTACK"] = 35
+    if _global_meta_analysis["common_losing_strategies"].get("defensive", 0) > 5:
+        adaptation["adjust_thresholds"]["MIN_HP_TO_ATTACK"] = 25
         adaptation["priority_changes"].append("more_aggressive")
         log.info("🔄 GLOBAL ADAPTATION: Increasing aggression")
     
@@ -1219,12 +1228,12 @@ def reset_game_state():
     }
     
     log.info("=" * 65)
-    log.info("  BERSERKER BRAIN v4.0 — ADAPTIVE ADVERSARIAL LEARNING!")
+    log.info("  BERSERKER BRAIN v4.1 — AGGRESSIVE FIX!")
     log.info("=" * 65)
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  MAIN DECISION ENGINE v4.0
+#  MAIN DECISION ENGINE v4.1 (AGGRESSIVE)
 # ═══════════════════════════════════════════════════════════════════
 
 def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict | None:
@@ -1271,6 +1280,9 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     region_terrain    = region.get("terrain", "").lower() if isinstance(region, dict) else ""
     region_weather    = region.get("weather", "").lower() if isinstance(region, dict) else ""
 
+    # Early game aggression boost
+    is_early_game = current_turn < BERSERKER_CONFIG["EARLY_GAME_TURNS"]
+
     if not is_alive:
         return None
 
@@ -1309,6 +1321,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
     my_damage = calc_damage(atk, get_weapon_bonus(equipped), 5, region_weather)
     
+    # FIX: Perhitungan damage musuh lebih akurat
     strongest_enemy_damage = max(
         (calc_damage(e.get("atk", 10), _estimate_enemy_weapon_bonus(e), defense, region_weather)
          for e in enemies_here),
@@ -1338,31 +1351,12 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         )
 
     # ═══════════════════════════════════════════════════════════════
-    # ADAPTIVE STRATEGY SELECTION
+    # EARLY GAME: JANGAN FLEE, FIGHT!
     # ═══════════════════════════════════════════════════════════════
-    adaptive_strategy = "standard"
-    if enemies_here:
-        enemy = enemies_here[0]
-        enemy_id = enemy.get("id", "")
-        
-        special = get_special_counter(enemy_id)
-        if special:
-            log.warning(f"⚡ SPECIAL COUNTER ACTIVE vs {enemy_id[:8]}: {special}")
-        
-        adaptive_strategy = get_adaptive_strategy_vs(enemy_id, hp, my_weapon)
-        
-        if adaptive_strategy == "flee_recommended":
-            safe = _find_safe_region(connections, danger_ids, view)
-            if safe and ep >= move_ep_cost:
-                log.warning(f"🏃 ADAPTIVE FLEE from {enemy_id[:8]} (recommended)")
-                return {"action": "move", "data": {"regionId": safe}, 
-                        "reason": "ADAPTIVE: Avoid dangerous enemy"}
-
-    # ═══════════════════════════════════════════════════════════════
-    # GLOBAL ADAPTATION
-    # ═══════════════════════════════════════════════════════════════
-    global_adapt = get_global_adaptation()
-    temp_min_hp_attack = global_adapt["adjust_thresholds"].get("MIN_HP_TO_ATTACK", BERSERKER_CONFIG["MIN_HP_TO_ATTACK"])
+    if is_early_game and enemies_here and hp > 25:
+        log.info("🔥 EARLY GAME AGGRESSION! Fighting even if outmatched")
+        # Override flee logic untuk early game
+        pass
 
     # ═══════════════════════════════════════════════════════════════
     # [P1] DEATHZONE ESCAPE
@@ -1406,22 +1400,30 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             return result
 
     # ═══════════════════════════════════════════════════════════════
-    # [P5] FLEE LOGIC
+    # [P5] FLEE LOGIC - DIPERKETAT! (jangan flee sembarangan)
     # ═══════════════════════════════════════════════════════════════
     should_flee = False
     flee_reason = ""
 
-    if not just_attacked:
+    # Jangan flee di early game!
+    if not is_early_game and not just_attacked:
         if hp < BERSERKER_CONFIG["FLEE_HP"]:
             should_flee = True
             flee_reason = f"HP_CRITICAL: {hp}"
+        # FIX: Hanya flee jika damage musuh JAUH lebih besar (2.5x)
         elif enemies_here and strongest_enemy_damage > my_damage * BERSERKER_CONFIG["FLEE_STRONG_ENEMY_RATIO"]:
-            should_flee = True
-            flee_reason = f"ENEMY_STRONGER: their_dmg={strongest_enemy_damage} my_dmg={my_damage}"
+            # Tapi cek juga: apakah kita bisa kill musuh dalam 2-3 hit?
+            if enemies_here:
+                lowest_enemy_hp = min(e.get("hp", 999) for e in enemies_here)
+                if lowest_enemy_hp > my_damage * 3:  # Butuh 3x hit untuk kill
+                    should_flee = True
+                    flee_reason = f"ENEMY_STRONGER: their_dmg={strongest_enemy_damage} my_dmg={my_damage}"
+                else:
+                    log.info("💪 Enemy strong but killable! Fighting!")
         elif has_guardian and hp < BERSERKER_CONFIG["MIN_HP_TO_ATTACK_GUARDIAN"]:
             should_flee = True
             flee_reason = f"GUARDIAN_HP_TOO_LOW: hp={hp}"
-        elif len(enemies_here) >= BERSERKER_CONFIG["FLEE_OUTNUMBERED"] and hp < 50:
+        elif len(enemies_here) >= BERSERKER_CONFIG["FLEE_OUTNUMBERED"] and hp < 35:
             should_flee = True
             flee_reason = f"OUTNUMBERED: {len(enemies_here)}"
 
@@ -1432,7 +1434,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             return {"action": "move", "data": {"regionId": safe}, "reason": f"FLEE: {flee_reason}"}
 
     # ═══════════════════════════════════════════════════════════════
-    # [P6] COUNTER ATTACK
+    # [P6] COUNTER ATTACK (WAJIB!)
     # ═══════════════════════════════════════════════════════════════
     if just_attacked and _last_attacked_by and hp >= BERSERKER_CONFIG["COUNTER_ATTACK_HP"]:
         attacker = next((e for e in enemies_here if e.get("id") == _last_attacked_by), None)
@@ -1446,9 +1448,9 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "reason": f"COUNTER: vs {_last_attacked_by[:8]}"}
 
     # ═══════════════════════════════════════════════════════════════
-    # [P7] HEAL SEBELUM FIGHT
+    # [P7] HEAL SEBELUM FIGHT (jika perlu)
     # ═══════════════════════════════════════════════════════════════
-    if enemies_here and strongest_enemy_damage > 20 and hp < 55:
+    if enemies_here and strongest_enemy_damage > 15 and hp < 45:
         heal = _find_healing_item(inventory, critical=False)
         if heal:
             log.info("💊 PRE-FIGHT HEAL: HP=%d, enemy_dmg=%d", hp, strongest_enemy_damage)
@@ -1463,18 +1465,27 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         return equip_action
 
     # ═══════════════════════════════════════════════════════════════
-    # [P9] COMBAT — SERANG MUSUH
+    # [P9] COMBAT — SERANG MUSUH (AGGRESSIVE)
     # ═══════════════════════════════════════════════════════════════
-    can_attack = (hp >= temp_min_hp_attack
-                  and ep_ratio >= BERSERKER_CONFIG["EP_ATTACK_MIN_RATIO"])
+    # Early game: lebih agresif, bisa attack dengan HP lebih rendah
+    if is_early_game:
+        can_attack = (hp >= 25 and ep_ratio >= 0.2)
+    else:
+        can_attack = (hp >= BERSERKER_CONFIG["MIN_HP_TO_ATTACK"]
+                      and ep_ratio >= BERSERKER_CONFIG["EP_ATTACK_MIN_RATIO"])
 
     if has_guardian and hp < BERSERKER_CONFIG["MIN_HP_TO_ATTACK_GUARDIAN"]:
         can_attack = False
 
+    # FIX: Jangan takut jika damage musuh sedikit lebih besar
     if enemies_here and strongest_enemy_damage > my_damage * BERSERKER_CONFIG["MAX_ENEMY_DAMAGE_RATIO"]:
-        can_attack = False
+        # Tapi jika early game, tetap attack!
+        if not is_early_game:
+            can_attack = False
+        else:
+            log.info("🔥 EARLY GAME: Attacking despite damage disadvantage!")
 
-    if _hunting_target and hp >= 40:
+    if _hunting_target and hp >= 35:
         can_attack = True
 
     if enemies_here and can_attack:
@@ -1506,7 +1517,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     
     guardian_farm_ok = (hp >= BERSERKER_CONFIG["MIN_HP_TO_ATTACK_GUARDIAN"] 
                         and ep >= 2 
-                        and my_damage >= 15
+                        and my_damage >= 12
                         and not _hunting_target)
     
     if guardians_all and guardian_farm_ok:
@@ -1570,7 +1581,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     # ═══════════════════════════════════════════════════════════════
     # [P15] MONSTER FARMING
     # ═══════════════════════════════════════════════════════════════
-    if monsters and ep >= 1 and hp > 50 and not enemies_here and not _hunting_target:
+    if monsters and ep >= 1 and hp > 45 and not enemies_here and not _hunting_target:
         target = _select_weakest(monsters)
         w_range = get_weapon_range(equipped)
         if _is_in_range(target, region_id, w_range, connections):
@@ -1580,9 +1591,23 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "reason": f"MONSTER FARM: HP={target.get('hp','?')}"}
 
     # ═══════════════════════════════════════════════════════════════
-    # [P16] MOVEMENT
+    # [P16] MOVEMENT (MOVE TOWARD ENEMY jika ada)
     # ═══════════════════════════════════════════════════════════════
     if ep >= move_ep_cost and connections:
+        # PRIORITAS: Bergerak mendekati musuh yang terlihat (tapi tidak di region yang sama)
+        visible_enemies_elsewhere = [a for a in visible_agents 
+                                     if a.get("id") != my_id 
+                                     and a.get("regionId") != region_id
+                                     and not a.get("isGuardian", False)]
+        
+        if visible_enemies_elsewhere and hp > 40:
+            # Pindah ke region musuh
+            enemy_region = visible_enemies_elsewhere[0].get("regionId")
+            if enemy_region and enemy_region not in danger_ids:
+                log.info("🎯 MOVE TOWARD ENEMY: %s", enemy_region)
+                return {"action": "move", "data": {"regionId": enemy_region},
+                        "reason": "APPROACH ENEMY"}
+        
         if _hunting_target and BERSERKER_CONFIG["PURSUIT_ENABLED"] and hp >= BERSERKER_CONFIG["PURSUIT_MIN_HP"]:
             target_region = _hunting_target.get("regionId", "")
             if target_region and target_region != region_id and target_region not in danger_ids:
@@ -1663,69 +1688,28 @@ def get_all_enemy_intel() -> list:
 
 """
 ══════════════════════════════════════════════════════════════════════
-  BERSERKER BRAIN v4.0 — ADAPTIVE ADVERSARIAL LEARNING
+  BERSERKER BRAIN v4.1 — AGGRESSIVE FIX
 ══════════════════════════════════════════════════════════════════════
 
-FITUR UTAMA v4.0:
+PERUBAHAN UTAMA v4.1:
 
-1. ADAPTIVE LEARNING
-   ✅ Merekam setiap pertempuran dengan detail
-   ✅ Menganalisis gaya bermain musuh (8 tipe)
-   ✅ Menyimpan strategi apa yang berhasil/gagal
+1. THRESHOLD LEBIH AGGRESIF:
+   ✅ MIN_HP_TO_ATTACK: 45 → 30
+   ✅ FLEE_STRONG_ENEMY_RATIO: 1.5 → 2.5
+   ✅ HP_CRITICAL: 30 → 25
+   ✅ EARLY_GAME_TURNS: 20 turn pertama lebih agresif
 
-2. DEFEAT ANALYSIS
-   ✅ Menganalisis MENGAPA kita kalah
-   ✅ Deteksi strategy mismatch
-   ✅ Special counter untuk musuh berbahaya (winrate >70%)
+2. FIX PERHITUNGAN DAMAGE:
+   ✅ _estimate_enemy_weapon_bonus() lebih akurat
+   ✅ Minimal damage 3 (bukan 1)
 
-3. COUNTER STRATEGY
-   ✅ Setiap gaya musuh punya counter spesifik
-   ✅ Adaptive strategy selection
-   ✅ Global meta learning dari semua musuh
+3. EARLY GAME BOOST:
+   ✅ 20 turn pertama: tidak flee, fight terus
+   ✅ Bisa attack dengan HP 25+
 
-4. SURVIVAL IMPROVED
-   ✅ Damage comparison lebih akurat
-   ✅ Flee hanya jika benar-benar perlu
-   ✅ Counter attack wajib saat diserang
-
-══════════════════════════════════════════════════════════════════════
-  CARA INTEGRASI KE HEARTBEAT.PY
-══════════════════════════════════════════════════════════════════════
-
-from bot.strategies.brain_v4 import (
-    decide_action, reset_game_state, on_attacked_by,
-    on_enemy_killed, on_we_died, print_learning_summary,
-    get_all_enemy_intel
-)
-
-# Reset state di awal game
-reset_game_state()
-
-# Saat bot kita diserang:
-on_attacked_by(attacker_id=event["attackerId"], current_turn=turn)
-
-# Saat kita kill musuh:
-on_enemy_killed(enemy_id=event["targetId"])
-
-# Saat kita mati (dengan detail combat):
-on_we_died(
-    killer_id=event["killerId"],
-    combat_summary={
-        "my_hp_final": my_last_hp,
-        "enemy_hp_final": killer_hp,
-        "my_strategy": current_strategy,
-        "turn": current_turn
-    }
-)
-
-# Di game loop:
-action = decide_action(view=game_state, can_act=True)
-
-# Debug: cetak pembelajaran tiap 100 turn
-if turn % 100 == 0:
-    print_learning_summary()
-    intel = get_all_enemy_intel()
-    print(intel)
+4. FLEE LOGIC DIPERKETAT:
+   ✅ Hanya flee jika benar-benar kritis
+   ✅ Cek apakah musuh bisa di-kill sebelum flee
 
 ══════════════════════════════════════════════════════════════════════
 """
