@@ -7,7 +7,7 @@ from bot.api_client import MoltyAPI, APIError
 from bot.utils.logger import get_logger
 
 log = get_logger(__name__)
-
+log.info("Calling endpoint: %s", url)
 
 async def join_free_game(api: MoltyAPI) -> tuple[str, str]:
     """
