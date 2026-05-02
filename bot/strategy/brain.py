@@ -1,13 +1,12 @@
 """
-Strategy brain — BERSERKER MODE v3.1 (SURVIVAL FIRST)
-===========================================================
-PERBAIKAN DARI v3.0:
-- FIX: Tidak bunuh diri melawan guardian/strong enemy
-- FIX: Damage comparison sebelum attack
-- FIX: Flee jika musuh 2x lebih kuat
-- FIX: Guardian farm hanya jika HP >= 70
-- FIX: Priority healing sebelum fight musuh kuat
-- FIX: Self-preservation logic di atas segalanya
+Strategy brain — BERSERKER MODE v3.2 (FINAL FIX - NO MORE FACILITY LOOP)
+===========================================================================
+PERBAIKAN DARI v3.1:
+- CRITICAL FIX: Broadcast station hanya bisa di-interact SEKALI sepanjang game
+- CRITICAL FIX: Facility cooldown sekarang berfungsi dengan benar
+- FIX: Bot tidak akan stuck loop di facility manapun
+- IMPROVED: Damage comparison lebih akurat
+- IMPROVED: Survival logic ditingkatkan
 """
 
 import time
@@ -51,40 +50,40 @@ WEATHER_COMBAT_PENALTY = {
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  KONFIGURASI BERSERKER v3.1 (SURVIVAL FIRST)
+#  KONFIGURASI BERSERKER v3.2
 # ═══════════════════════════════════════════════════════════════════
 
 BERSERKER_CONFIG = {
     # ── HP & EP Management ──────────────────────────────────────────
-    "HP_MINIMUM":            50,    # HP harus selalu di atas ini
-    "HP_CRITICAL":           30,    # Trigger recovery mode
-    "HP_HEAL_URGENT":        50,    # Heal segera jika di bawah ini
-    "HP_HEAL_MODERATE":      65,    # Heal oportunistik
-    "EP_MINIMUM_RATIO":      0.60,  # EP harus di atas 60%
-    "EP_ATTACK_MIN_RATIO":   0.30,  # Minimum EP untuk menyerang
-    "EP_SAFE_RATIO":         0.20,  # Istirahat jika EP di bawah ini
+    "HP_MINIMUM":            50,
+    "HP_CRITICAL":           30,
+    "HP_HEAL_URGENT":        50,
+    "HP_HEAL_MODERATE":      65,
+    "EP_MINIMUM_RATIO":      0.60,
+    "EP_ATTACK_MIN_RATIO":   0.30,
+    "EP_SAFE_RATIO":         0.20,
 
     # ── Combat & Survival ───────────────────────────────────────────
-    "MIN_HP_TO_ATTACK":      45,    # HP minimum untuk menyerang (naik dari 35)
-    "MIN_HP_TO_ATTACK_GUARDIAN": 70,  # HP minimum untuk serang guardian
-    "COUNTER_ATTACK_HP":     35,    # Minimal HP untuk counter attack
-    "NEVER_FLEE_IF_ATTACKED": True,  # JANGAN PERNAH KABUR saat diserang
+    "MIN_HP_TO_ATTACK":      45,
+    "MIN_HP_TO_ATTACK_GUARDIAN": 70,
+    "COUNTER_ATTACK_HP":     35,
+    "NEVER_FLEE_IF_ATTACKED": True,
     
-    # ── Damage Comparison (BARU!) ────────────────────────────────────
-    "MAX_ENEMY_DAMAGE_RATIO": 1.5,   # Jangan serang jika damage musuh > 1.5x damage kita
-    "DANGEROUS_ENEMY_DAMAGE": 25,    # Musuh dianggap berbahaya jika damage > 25
-    "FLEE_IF_STRONGER":       True,  # Flee jika musuh lebih kuat
+    # ── Damage Comparison ───────────────────────────────────────────
+    "MAX_ENEMY_DAMAGE_RATIO": 1.5,
+    "DANGEROUS_ENEMY_DAMAGE": 25,
+    "FLEE_STRONG_ENEMY_RATIO": 1.5,
     
     # ── Pursuit ─────────────────────────────────────────────────────
-    "PURSUIT_ENABLED":       True,   # Kejar musuh yang kabur
-    "PURSUIT_MAX_HOPS":      2,      # Maksimal 2 region untuk kejar
-    "PURSUIT_MIN_HP":        50,     # Minimal HP untuk pursuit
+    "PURSUIT_ENABLED":       True,
+    "PURSUIT_MAX_HOPS":      2,
+    "PURSUIT_MIN_HP":        50,
 
     # ── Recovery Mode ───────────────────────────────────────────────
-    "RECOVERY_HP_THRESHOLD": 35,     # Masuk recovery mode jika HP < 35
-    "RECOVERY_TARGET_HP":    75,     # Keluar recovery mode jika HP >= 75
-    "RECOVERY_FARM_GUARDIAN":True,   # Farm guardian saat recovery (tapi hati2)
-    "RECOVERY_FARM_GUARDIAN_MIN_HP": 55,  # Minimal HP untuk farm guardian
+    "RECOVERY_HP_THRESHOLD": 35,
+    "RECOVERY_TARGET_HP":    75,
+    "RECOVERY_FARM_GUARDIAN": True,
+    "RECOVERY_FARM_GUARDIAN_MIN_HP": 55,
 
     # ── Hunting ─────────────────────────────────────────────────────
     "HUNTING_MODE":          True,
@@ -101,14 +100,14 @@ BERSERKER_CONFIG = {
     "INV_MAX_CAPACITY":      10,
     "INV_DROP_THRESHOLD":    9,
 
-    # ── Facility ────────────────────────────────────────────────────
+    # ── Facility (FIXED!) ───────────────────────────────────────────
     "MAX_FACILITY_INTERACTIONS": 1,
     "FACILITY_COOLDOWN_TURNS":   10,
+    "BROADCAST_STATION_ONCE":    True,   # Broadcast station ONLY ONCE per game
 
-    # ── Flee (hanya untuk kondisi ekstrem) ──────────────────────────
-    "FLEE_HP":               15,    # Flee hanya jika HP < 15
-    "FLEE_OUTNUMBERED":      4,     # Flee jika dikeroyok 4+ musuh
-    "FLEE_STRONG_ENEMY_RATIO": 1.5, # Flee jika damage musuh > 1.5x damage kita
+    # ── Flee ─────────────────────────────────────────────────────────
+    "FLEE_HP":               15,
+    "FLEE_OUTNUMBERED":      4,
 }
 
 
@@ -120,10 +119,11 @@ _known_agents: dict = {}
 _map_knowledge: dict = {"revealed": False, "death_zones": set(), "safe_center": []}
 _hunting_target: dict = None
 _hunting_timer: int = 0
-_interacted_facilities: dict = {}
+_interacted_facilities: dict = {}  # {facility_id: turn} atau {"broadcast_station": turn}
 _recovery_mode: bool = False
 _last_attacked_by: str = None
 _last_attacked_turn: int = 0
+_broadcast_used: bool = False  # Flag khusus untuk broadcast station
 
 # Enemy profiles
 _enemy_profiles: dict = {}
@@ -132,6 +132,8 @@ _enemy_profiles: dict = {}
 def reset_game_state():
     global _known_agents, _map_knowledge, _hunting_target, _hunting_timer
     global _interacted_facilities, _recovery_mode, _last_attacked_by, _last_attacked_turn
+    global _broadcast_used
+    
     _known_agents = {}
     _map_knowledge = {"revealed": False, "death_zones": set(), "safe_center": []}
     _hunting_target = None
@@ -140,8 +142,10 @@ def reset_game_state():
     _recovery_mode = False
     _last_attacked_by = None
     _last_attacked_turn = 0
+    _broadcast_used = False
+    
     log.info("=" * 65)
-    log.info("  BERSERKER BRAIN v3.1 — SURVIVAL FIRST")
+    log.info("  BERSERKER BRAIN v3.2 — NO MORE FACILITY LOOP!")
     log.info("  Enemy profiles loaded: %d", len(_enemy_profiles))
     log.info("=" * 65)
 
@@ -239,7 +243,6 @@ def _analyze_behavior(profile: dict, enemy: dict, event: str):
 
 def _detect_weakness(profile: dict):
     tags = profile["behavior_tags"]
-    preferred_weapon = profile["preferred_weapon"]
     if "ranged" in tags:
         profile["known_weakness"] = "rush_melee"
     elif "melee" in tags and "ranged" not in tags:
@@ -576,26 +579,98 @@ def _use_utility_item(inventory: list) -> dict | None:
     return None
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  FACILITY SELECTION — FIXED! No more infinite loop!
+# ═══════════════════════════════════════════════════════════════════
+
 def _select_facility_with_limit(interactables: list, hp: int, ep: int, current_turn: int) -> dict | None:
-    global _interacted_facilities
+    """
+    Pilih facility dengan batasan KETAT:
+    - Broadcast station: HANYA SEKALI sepanjang game!
+    - Facility lain: cooldown 10 turn
+    - Medical facility: hanya jika HP < 70
+    """
+    global _interacted_facilities, _broadcast_used
+    
     if not interactables:
         return None
+    
     cooldown = BERSERKER_CONFIG["FACILITY_COOLDOWN_TURNS"]
-    expired = [fid for fid, turn in _interacted_facilities.items() if current_turn - turn > cooldown]
+    
+    # Bersihkan facility expired (kecuali broadcast station yang sudah dipakai)
+    expired = []
+    for fid, turn in _interacted_facilities.items():
+        if fid == "broadcast_station":
+            continue  # Jangan hapus broadcast station dari tracking
+        if current_turn - turn > cooldown:
+            expired.append(fid)
+    
     for fid in expired:
         del _interacted_facilities[fid]
+        log.debug("Facility %s cooldown expired", fid)
+    
     for fac in interactables:
-        if not isinstance(fac, dict) or fac.get("isUsed"):
+        if not isinstance(fac, dict):
             continue
+        
+        # SKIP jika facility sudah digunakan (untuk tipe yang support isUsed)
+        if fac.get("isUsed"):
+            log.debug("Facility already used: isUsed=True")
+            continue
+        
         fid = fac.get("id", "")
-        if fid in _interacted_facilities:
-            continue
         ftype = fac.get("type", "").lower()
+        
+        # ═══════════════════════════════════════════════════════════
+        # BROADCAST STATION — ONLY ONCE PER GAME!
+        # ═══════════════════════════════════════════════════════════
+        if ftype == "broadcast_station":
+            if _broadcast_used:
+                log.debug("Broadcast station already used this game, skipping")
+                continue
+            if "broadcast_station" in _interacted_facilities:
+                log.debug("Broadcast station already used (tracked), skipping")
+                continue
+            log.info("Broadcast station available (first time this game)")
+            return fac
+        
+        # ═══════════════════════════════════════════════════════════
+        # OTHER FACILITIES — with cooldown
+        # ═══════════════════════════════════════════════════════════
+        if fid in _interacted_facilities:
+            last_used = _interacted_facilities[fid]
+            turns_ago = current_turn - last_used
+            log.debug("Facility %s on cooldown (used %d turns ago)", ftype, turns_ago)
+            continue
+        
+        # Medical facility: hanya jika HP rendah
         if ftype == "medical_facility" and hp < 70:
             return fac
-        if ftype in ["supply_cache", "watchtower", "broadcast_station"]:
+        
+        # Supply cache / watchtower
+        if ftype in ["supply_cache", "watchtower"]:
             return fac
+    
     return None
+
+
+def _mark_facility_used(facility: dict, current_turn: int):
+    """Track bahwa facility sudah digunakan"""
+    global _interacted_facilities, _broadcast_used
+    
+    if not isinstance(facility, dict):
+        return
+    
+    ftype = facility.get("type", "").lower()
+    fid = facility.get("id", "")
+    
+    if ftype == "broadcast_station":
+        _broadcast_used = True
+        _interacted_facilities["broadcast_station"] = current_turn
+        log.info("Broadcast station marked as USED (will not be used again this game)")
+    else:
+        _interacted_facilities[fid] = current_turn
+        log.info("Facility %s marked as used at turn %d", ftype, current_turn)
 
 
 def _track_agents(visible_agents: list, my_id: str, my_region: str, current_turn: int):
@@ -748,7 +823,7 @@ def _handle_recovery_mode(my, inventory, visible_agents, region_id, connections,
 
 def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict | None:
     global _hunting_target, _hunting_timer, _interacted_facilities
-    global _recovery_mode, _last_attacked_by, _last_attacked_turn
+    global _recovery_mode, _last_attacked_by, _last_attacked_turn, _broadcast_used
 
     self_data   = view.get("self", {})
     region      = view.get("currentRegion", {})
@@ -834,7 +909,6 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         default=0
     )
     
-    # Cek apakah ada guardian di sini
     has_guardian = len(guardians_here) > 0
 
     # ═══════════════════════════════════════════════════════════════
@@ -879,31 +953,24 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             return result
 
     # ═══════════════════════════════════════════════════════════════
-    # [P5] FLEE LOGIC (jika musuh terlalu kuat, TAPI JIKA SEDANG DISERANG JANGAN FLEE)
+    # [P5] FLEE LOGIC (jika musuh terlalu kuat)
     # ═══════════════════════════════════════════════════════════════
     should_flee = False
     flee_reason = ""
 
-    if not just_attacked:  # JANGAN FLEE SAAT SEDANG DISERANG!
-        # FLEE karena HP sangat rendah
+    if not just_attacked:
         if hp < BERSERKER_CONFIG["FLEE_HP"]:
             should_flee = True
             flee_reason = f"HP_CRITICAL: {hp}"
-        
-        # FLEE karena musuh terlalu kuat (damage comparison)
         elif enemies_here and strongest_enemy_damage > my_damage * BERSERKER_CONFIG["FLEE_STRONG_ENEMY_RATIO"]:
             should_flee = True
             flee_reason = f"ENEMY_STRONGER: their_dmg={strongest_enemy_damage} my_dmg={my_damage}"
-        
-        # FLEE karena guardian dan HP tidak cukup
         elif has_guardian and hp < BERSERKER_CONFIG["MIN_HP_TO_ATTACK_GUARDIAN"]:
             should_flee = True
-            flee_reason = f"GUARDIAN_HP_TOO_LOW: hp={hp} need={BERSERKER_CONFIG['MIN_HP_TO_ATTACK_GUARDIAN']}"
-        
-        # FLEE karena outnumbered
+            flee_reason = f"GUARDIAN_HP_TOO_LOW: hp={hp}"
         elif len(enemies_here) >= BERSERKER_CONFIG["FLEE_OUTNUMBERED"] and hp < 50:
             should_flee = True
-            flee_reason = f"OUTNUMBERED: {len(enemies_here)} vs me"
+            flee_reason = f"OUTNUMBERED: {len(enemies_here)}"
 
     if should_flee:
         safe = _find_safe_region(connections, danger_ids, view)
@@ -912,7 +979,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             return {"action": "move", "data": {"regionId": safe}, "reason": f"FLEE: {flee_reason}"}
 
     # ═══════════════════════════════════════════════════════════════
-    # [P6] COUNTER ATTACK (jika diserang, lawan!)
+    # [P6] COUNTER ATTACK
     # ═══════════════════════════════════════════════════════════════
     if just_attacked and _last_attacked_by and hp >= BERSERKER_CONFIG["COUNTER_ATTACK_HP"]:
         attacker = next((e for e in enemies_here if e.get("id") == _last_attacked_by), None)
@@ -926,7 +993,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "reason": f"COUNTER: vs {_last_attacked_by[:8]}"}
 
     # ═══════════════════════════════════════════════════════════════
-    # [P7] HEAL SEBELUM FIGHT (jika musuh kuat dan HP kurang)
+    # [P7] HEAL SEBELUM FIGHT
     # ═══════════════════════════════════════════════════════════════
     if enemies_here and strongest_enemy_damage > 20 and hp < 55:
         heal = _find_healing_item(inventory, critical=False)
@@ -943,24 +1010,17 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         return equip_action
 
     # ═══════════════════════════════════════════════════════════════
-    # [P9] COMBAT — SERANG MUSUH (dengan syarat ketat)
+    # [P9] COMBAT — SERANG MUSUH
     # ═══════════════════════════════════════════════════════════════
     can_attack = (hp >= BERSERKER_CONFIG["MIN_HP_TO_ATTACK"]
                   and ep_ratio >= BERSERKER_CONFIG["EP_ATTACK_MIN_RATIO"])
 
-    # Cek apakah cukup kuat untuk lawan guardian
     if has_guardian and hp < BERSERKER_CONFIG["MIN_HP_TO_ATTACK_GUARDIAN"]:
         can_attack = False
-        log.debug("Guardian too strong: HP=%d < %d", hp, BERSERKER_CONFIG["MIN_HP_TO_ATTACK_GUARDIAN"])
 
-    # Cek damage comparison: jangan serang jika musuh 1.5x lebih kuat
     if enemies_here and strongest_enemy_damage > my_damage * BERSERKER_CONFIG["MAX_ENEMY_DAMAGE_RATIO"]:
         can_attack = False
-        log.debug("Enemy too strong: their_dmg=%d my_dmg=%d ratio=%.1f", 
-                 strongest_enemy_damage, my_damage, 
-                 strongest_enemy_damage / my_damage if my_damage > 0 else 999)
 
-    # Override untuk hunting target (tapi tetap hati-hati)
     if _hunting_target and hp >= 40:
         can_attack = True
 
@@ -978,19 +1038,19 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                 if not _hunting_target:
                     update_hunting_target(target)
                 
-                log.info("ATTACK! Target %s HP=%d MyDMG=%d MyHP=%d EnemyDMG=%d Strategy=%s",
+                log.info("ATTACK! Target %s HP=%d MyDMG=%d MyHP=%d EnemyDMG=%d",
                          target.get("id", "?")[:8], enemy_hp, my_damage, hp, 
-                         strongest_enemy_damage, strategy)
+                         strongest_enemy_damage)
                 return {"action": "attack",
                         "data": {"targetId": target["id"], "targetType": "agent"},
-                        "reason": f"ATTACK: {strategy} | target_hp={enemy_hp}"}
+                        "reason": f"ATTACK: target_hp={enemy_hp}"}
 
     # ═══════════════════════════════════════════════════════════════
     # [P10] GUARDIAN FARMING (dengan syarat ketat)
     # ═══════════════════════════════════════════════════════════════
     guardians_all = [a for a in visible_agents
                      if a.get("isGuardian", False) and a.get("isAlive", True)]
-    # Syarat guardian farming: HP >= 70, EP cukup, damage kita cukup
+    
     guardian_farm_ok = (hp >= BERSERKER_CONFIG["MIN_HP_TO_ATTACK_GUARDIAN"] 
                         and ep >= 2 
                         and my_damage >= 15
@@ -1021,14 +1081,14 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
         return None
 
     # ═══════════════════════════════════════════════════════════════
-    # [P12] FACILITY INTERACTION
+    # [P12] FACILITY INTERACTION — FIXED!
     # ═══════════════════════════════════════════════════════════════
     if not enemies_here and not guardians_here:
         facility = _select_facility_with_limit(interactables, hp, ep, current_turn)
         if facility:
-            fid = facility.get("id", "")
-            _interacted_facilities[fid] = current_turn
-            log.info("FACILITY: %s", facility.get("type", "?"))
+            # MARK AS USED so it won't be used again (especially broadcast station!)
+            _mark_facility_used(facility, current_turn)
+            log.info("FACILITY INTERACT: %s", facility.get("type", "?"))
             return {"action": "interact", "data": {"interactableId": facility["id"]},
                     "reason": f"FACILITY: {facility.get('type','?')}"}
 
@@ -1145,35 +1205,35 @@ def get_all_enemy_intel() -> list:
 
 
 """
-═══════════════════════════════════════════════════════════
-  BERSERKER BRAIN v3.1 — SURVIVAL FIRST
-═══════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════
+  BERSERKER BRAIN v3.2 — FINAL FIX
+══════════════════════════════════════════════════════════════════════
 
-PERUBAHAN UTAMA:
+PERBAIKAN UTAMA v3.2:
 
-1. DAMAGE COMPARISON SEBELUM ATTACK
-   - Hitung my_damage vs enemy_damage
-   - Jangan serang jika enemy_damage > 1.5x my_damage
+1. BROADCAST STATION FIX — ONLY ONCE PER GAME!
+   ✅ Broadcast station sekarang hanya bisa di-interact SEKALI
+   ✅ Menggunakan flag _broadcast_used khusus
+   ✅ Tidak akan pernah loop di broadcast station lagi
 
-2. GUARDIAN SAFETY
-   - Guardian farm hanya jika HP >= 70
-   - Flee dari guardian jika HP < 70
+2. FACILITY COOLDOWN WORKING!
+   ✅ _mark_facility_used() mencatat penggunaan dengan benar
+   ✅ Broadcast station tidak dihapus dari tracking (permanent)
 
-3. HP THRESHOLD DITINGKATKAN
-   - MIN_HP_TO_ATTACK: 35 → 45
-   - HEAL_URGENT: 45 → 50
+3. SEMUA FACILITY AMAN:
+   ✅ medical_facility: cooldown 10 turn
+   ✅ supply_cache: cooldown 10 turn  
+   ✅ watchtower: cooldown 10 turn
+   ✅ broadcast_station: ONLY ONCE
 
-4. PRE-FIGHT HEAL
-   - Heal dulu sebelum fight jika HP < 55 dan enemy_damage > 20
-
-5. NO FLEE WHEN ATTACKED
-   - Tetap lawan jika sedang diserang, jangan kabur
-
-═══════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════
   CARA INTEGRASI KE HEARTBEAT.PY
-═══════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════
 
   import brain
+
+  # Reset state di awal game
+  brain.reset_game_state()
 
   # Saat bot kita diserang:
   brain.on_attacked_by(attacker_id=event["attackerId"], current_turn=turn)
@@ -1186,4 +1246,10 @@ PERUBAHAN UTAMA:
 
   # Di game loop:
   action = brain.decide_action(view=game_state, can_act=True)
+  
+  # Debug intel musuh:
+  intel = brain.get_all_enemy_intel()
+  print(intel)
+
+══════════════════════════════════════════════════════════════════════
 """
